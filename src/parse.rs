@@ -5,117 +5,44 @@ pub const WEEK: i64 = 7 * DAY;
 pub const GAP: i64 = 1_800_000;
 const ASCII_ZEROES: u64 = u64::from_le_bytes([b'0'; 8]);
 
-/// The dialect has no embedded delimiters, escaped quotes, or multiline values.
 #[inline]
-pub fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-    if N >= 4 && (16..=128).contains(&line.len()) {
-        return short_fields(line);
-    }
-    scalar_fields(line)
-}
-
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-#[inline]
-fn short_fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
-    // Use fixed shifts for all complete blocks. Only the overlapping last
-    // block needs a variable shift, and every load stays inside the row.
-    let last = line.len() - 16;
-    let load = |offset| {
-        // SAFETY: each caller supplies an offset at most line.len() - 16.
-        unsafe { punctuation(line.as_ptr().add(offset)) }
-    };
-    let (c, q) = load(last);
-    let mut commas = u128::from(c) << last;
-    let mut quotes = u128::from(q) << last;
-    macro_rules! block {
-        ($offset:expr) => {{
-            let (c, q) = load($offset);
-            commas |= u128::from(c) << $offset;
-            quotes |= u128::from(q) << $offset;
-        }};
-    }
-    block!(0);
-    if last > 16 {
-        block!(16);
-    }
-    if last > 32 {
-        block!(32);
-    }
-    if last > 48 {
-        block!(48);
-    }
-    if last > 64 {
-        block!(64);
-    }
-    if last > 80 {
-        block!(80);
-    }
-    if last > 96 {
-        block!(96);
-    }
+pub(crate) fn fields_from_masks<const N: usize>(
+    line: &[u8],
+    mut commas: u128,
+    quotes: u128,
+) -> Option<[&[u8]; N]> {
     if commas.count_ones() as usize != N - 1 {
         return None;
     }
+    // Each opening quote is at the beginning of a field. Adding those bits
+    // to the non-comma bits carries to the next delimiter (or out of the
+    // word for the final field). That predicts every required closing quote.
+    let openings = quotes & ((commas << 1) | 1);
+    let (ends, final_quoted) = (!commas).overflowing_add(openings);
+    let closings = ((ends & commas) >> 1) | (u128::from(final_quoted) << (line.len() - 1));
+    if quotes != openings | closings || openings & closings != 0 {
+        return None;
+    }
 
-    let mut result = [&[][..]; N];
+    let mut fields = [&[][..]; N];
     let mut start = 0;
-    let mut paired_quotes = 0;
-    for (index, field) in result.iter_mut().enumerate() {
+    for (index, field) in fields.iter_mut().enumerate() {
         let end = if index + 1 == N {
             line.len()
         } else {
-            let end = commas.trailing_zeros() as usize;
+            let position = commas.trailing_zeros() as usize;
             commas &= commas - 1;
-            end
+            position
         };
-        let raw = &line[start..end];
-        *field = if let [b'"', value @ .., b'"'] = raw {
-            paired_quotes += 2;
-            value
-        } else {
-            raw
-        };
+        let trim = usize::from(line.get(start) == Some(&b'"'));
+        *field = &line[start + trim..end - trim];
         start = end + 1;
     }
-    // Any quote that was not consumed as a whole-field pair is malformed.
-    (quotes.count_ones() == paired_quotes).then_some(result)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-unsafe fn punctuation(block: *const u8) -> (u16, u16) {
-    use std::arch::x86_64::*;
-    unsafe {
-        let bytes = _mm_loadu_si128(block.cast());
-        let commas = _mm_cmpeq_epi8(bytes, _mm_set1_epi8(b',' as i8));
-        let quotes = _mm_cmpeq_epi8(bytes, _mm_set1_epi8(b'"' as i8));
-        (
-            _mm_movemask_epi8(commas) as u16,
-            _mm_movemask_epi8(quotes) as u16,
-        )
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline]
-unsafe fn punctuation(block: *const u8) -> (u16, u16) {
-    use std::arch::aarch64::*;
-    unsafe {
-        let bytes = vld1q_u8(block);
-        let commas = vceqq_u8(bytes, vdupq_n_u8(b','));
-        let quotes = vceqq_u8(bytes, vdupq_n_u8(b'"'));
-        let weights = vld1q_u8([1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128].as_ptr());
-        let mask = |matches| {
-            let bits = vandq_u8(matches, weights);
-            u16::from(vaddv_u8(vget_low_u8(bits))) | (u16::from(vaddv_u8(vget_high_u8(bits))) << 8)
-        };
-        (mask(commas), mask(quotes))
-    }
+    Some(fields)
 }
 
 #[inline]
-fn scalar_fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
+pub fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     let mut result = [&[][..]; N];
     let mut tail = line;
     for (index, field) in result.iter_mut().enumerate() {
@@ -244,79 +171,106 @@ const MONTHS: [(i32, i64); 12] = [
     (334, 31),
 ];
 
-#[inline]
-fn civil_ms(s: &[u8]) -> Option<i64> {
-    const DATE_SEPARATORS: u64 = u64::from_le_bytes([0, 0, 0, 0, 255, 0, 0, 255]);
-    const CLOCK_SEPARATORS: u64 = u64::from_le_bytes([0, 0, 255, 0, 0, 255, 0, 0]);
-    const DATE_MARKS: u64 = u64::from_le_bytes(*b"\0\0\0\0-\0\0-");
-    const CLOCK_MARKS: u64 = u64::from_le_bytes(*b"\0\0:\0\0:\0\0");
+/// A validated date is reusable only when all ten input bytes match.
+pub struct DateCache {
+    slots: [([u8; 10], i64); 32],
+}
+
+impl Default for DateCache {
+    fn default() -> Self {
+        Self {
+            slots: [(*b"1970-01-01", 0); 32],
+        }
+    }
+}
+
+fn midnight(s: &[u8; 10]) -> Option<i64> {
+    const SEPARATORS: u64 = u64::from_le_bytes([0, 0, 0, 0, 255, 0, 0, 255]);
+    const MARKS: u64 = u64::from_le_bytes(*b"\0\0\0\0-\0\0-");
     let date = u64::from_le_bytes(s[..8].try_into().unwrap());
-    let clock = u64::from_le_bytes(s[11..19].try_into().unwrap());
-    if s[10] != b'T'
-        || date & DATE_SEPARATORS != DATE_MARKS
-        || clock & CLOCK_SEPARATORS != CLOCK_MARKS
-    {
+    if date & SEPARATORS != MARKS {
         return None;
     }
-    // Replace the checked separators with ASCII zeroes before validating digits.
-    let date = digits(date ^ ((ASCII_ZEROES ^ DATE_MARKS) & DATE_SEPARATORS))?;
-    let clock = digits(clock ^ ((ASCII_ZEROES ^ CLOCK_MARKS) & CLOCK_SEPARATORS))?;
-    let date_pairs = date * 10 + (date >> 8);
-    let clock_pairs = clock * 10 + (clock >> 8);
-    let year = (date_pairs & 255) * 100 + ((date_pairs >> 16) & 255);
-    let month = ((date_pairs >> 40) & 255) as usize;
+    let date = digits(date ^ ((ASCII_ZEROES ^ MARKS) & SEPARATORS))?;
+    let pairs = date * 10 + (date >> 8);
+    let year = (pairs & 255) * 100 + ((pairs >> 16) & 255);
+    let month = ((pairs >> 40) & 255) as usize;
     let day = two(s, 8)?;
-    let hour = (clock_pairs & 255) as i64;
-    let minute = ((clock_pairs >> 24) & 255) as i64;
-    let second = ((clock_pairs >> 48) & 255) as i64;
     let (year_start, leap) = YEARS[year as usize];
     let &(month_start, length) = MONTHS.get(month.wrapping_sub(1))?;
-    if day == 0
-        || day > length + i64::from(leap && month == 2)
-        || hour > 23
-        || minute > 59
-        || second > 59
-    {
+    if day == 0 || day > length + i64::from(leap && month == 2) {
         return None;
     }
     let days = i64::from(year_start + month_start) + day - 1 + i64::from(leap && month > 2);
-    Some(days * DAY + ((hour * 60 + minute) * 60 + second) * 1000)
+    Some(days * DAY)
 }
 
-pub fn utc(s: &[u8]) -> Option<i64> {
-    if s.len() != 20 || s[19] != b'Z' {
-        return None;
+impl DateCache {
+    #[inline]
+    fn civil_ms(&mut self, s: &[u8]) -> Option<i64> {
+        const SEPARATORS: u64 = u64::from_le_bytes([0, 0, 255, 0, 0, 255, 0, 0]);
+        const MARKS: u64 = u64::from_le_bytes(*b"\0\0:\0\0:\0\0");
+        let clock = u64::from_le_bytes(s[11..19].try_into().unwrap());
+        if s[10] != b'T' || clock & SEPARATORS != MARKS {
+            return None;
+        }
+        let clock = digits(clock ^ ((ASCII_ZEROES ^ MARKS) & SEPARATORS))?;
+        let pairs = clock * 10 + (clock >> 8);
+        let hour = (pairs & 255) as i64;
+        let minute = ((pairs >> 24) & 255) as i64;
+        let second = ((pairs >> 48) & 255) as i64;
+        if hour > 23 || minute > 59 || second > 59 {
+            return None;
+        }
+        let date: &[u8; 10] = s[..10].try_into().unwrap();
+        let slot = &mut self.slots[(usize::from(s[8]) * 10 + usize::from(s[9])) & 31];
+        if slot.0 != *date {
+            *slot = (*date, midnight(date)?);
+        }
+        Some(slot.1 + ((hour * 60 + minute) * 60 + second) * 1000)
     }
-    civil_ms(s)
+
+    #[inline]
+    pub fn utc(&mut self, s: &[u8]) -> Option<i64> {
+        if s.len() != 20 || s[19] != b'Z' {
+            return None;
+        }
+        self.civil_ms(s)
+    }
+
+    #[inline]
+    pub fn timestamp(&mut self, s: &[u8]) -> Option<i64> {
+        if let Ok(bytes) = <&[u8; 13]>::try_from(s) {
+            let prefix = decimal_eight(u64::from_le_bytes(bytes[..8].try_into().unwrap()))?;
+            let suffix = decimal_eight(u64::from_le_bytes([
+                b'0', b'0', b'0', bytes[8], bytes[9], bytes[10], bytes[11], bytes[12],
+            ]))?;
+            return Some(prefix * 100_000 + suffix);
+        }
+        if s.get(4) == Some(&b'-') {
+            if s.len() == 20 {
+                return self.utc(s);
+            }
+            if s.len() != 25 || s[22] != b':' {
+                return None;
+            }
+            let sign = match s[19] {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return None,
+            };
+            let hour = two(s, 20)?;
+            let minute = two(s, 23)?;
+            if hour > 23 || minute > 59 {
+                return None;
+            }
+            return Some(self.civil_ms(s)? - sign * (hour * 60 + minute) * 60_000);
+        }
+        decimal(s, i64::MAX)
+    }
 }
 
-#[inline]
+#[cfg(test)]
 pub fn timestamp(s: &[u8]) -> Option<i64> {
-    if let Ok(bytes) = <&[u8; 13]>::try_from(s) {
-        let prefix = decimal_eight(u64::from_le_bytes(bytes[..8].try_into().unwrap()))?;
-        let suffix = decimal_eight(u64::from_le_bytes([
-            b'0', b'0', b'0', bytes[8], bytes[9], bytes[10], bytes[11], bytes[12],
-        ]))?;
-        return Some(prefix * 100_000 + suffix);
-    }
-    if s.get(4) == Some(&b'-') {
-        if s.len() == 20 {
-            return utc(s);
-        }
-        if s.len() != 25 || s[22] != b':' {
-            return None;
-        }
-        let sign = match s[19] {
-            b'+' => 1,
-            b'-' => -1,
-            _ => return None,
-        };
-        let hour = two(s, 20)?;
-        let minute = two(s, 23)?;
-        if hour > 23 || minute > 59 {
-            return None;
-        }
-        return Some(civil_ms(s)? - sign * (hour * 60 + minute) * 60_000);
-    }
-    decimal(s, i64::MAX)
+    DateCache::default().timestamp(s)
 }

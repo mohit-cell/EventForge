@@ -220,3 +220,134 @@ fn dialect_matches_independent_splitter_exhaustively() {
         }
     }
 }
+
+#[test]
+fn structural_scanner_matches_scalar_rows_at_every_block_offset() {
+    fn compare<const N: usize>(data: &[u8]) {
+        let expected: Vec<_> = lines(data).filter_map(fields::<N>).collect();
+        let mut result = Vec::new();
+        crate::csv::records(data, |row: [&[u8]; N]| result.push(row));
+        assert_eq!(result, expected);
+    }
+    let mut data = Vec::new();
+    // Include all short records over this dialect alphabet, interleaved
+    // with longer rows and good records to catch cross-row contamination.
+    let alphabet = b"x,\x22\r\0";
+    for mut code in 0..alphabet.len().pow(6) {
+        for _ in 0..6 {
+            data.push(alphabet[code % alphabet.len()]);
+            code /= alphabet.len();
+        }
+        data.push(b'\n');
+    }
+    for offset in 0..64 {
+        for size in [15, 31, 63, 64, 65, 95, 127, 128, 129, 279] {
+            let padding = (64 + offset - data.len() % 64) % 64;
+            data.extend(std::iter::repeat_n(b'\n', padding));
+            let mut row = vec![b'x'; size];
+            row[..5].copy_from_slice(b"a,\"\",");
+            row[size - 9..].copy_from_slice(b",\"q\",b,,c");
+            data.extend_from_slice(&row);
+            data.push(b'\n');
+            row[size / 2] = b'"';
+            data.extend_from_slice(&row);
+            data.push(b'\n');
+        }
+    }
+    data.extend_from_slice(b"last,\"row\",no,lf");
+    compare::<2>(&data);
+    compare::<4>(&data);
+    compare::<7>(&data);
+    for len in 0..=192 {
+        compare::<4>(&data[..len]);
+    }
+}
+
+#[test]
+fn date_cache_checks_full_dates_across_collisions_and_calendar_changes() {
+    let mut dates = crate::parse::DateCache::default();
+    for (date, expected) in [
+        ("1970-01-01T00:00:00Z", Some(0)),
+        ("1970-02-01T00:00:00Z", Some(31 * DAY)),
+        ("1971-01-01T00:00:00Z", Some(365 * DAY)),
+        ("1970-13-01T00:00:00Z", None),
+        ("1970-01-01T00:00:00Z", Some(0)),
+        ("1970-01-01T24:00:00Z", None),
+        ("1970-01-01T00:01:00+00:01", Some(0)),
+    ] {
+        assert_eq!(dates.timestamp(date.as_bytes()), expected);
+    }
+}
+
+#[test]
+fn dense_dimension_lookup_keeps_exact_spelling_and_sparse_ids() {
+    let names = [
+        "p1",
+        "p0",
+        "p01",
+        "p3",
+        "p99999999",
+        "p100000000",
+        "P1",
+        "p 1",
+        "é",
+    ];
+    let lookup = crate::catalog::Lookup::new(names.iter().enumerate().map(|(i, &s)| (s, i as u32)));
+    for (i, name) in names.iter().enumerate() {
+        assert_eq!(lookup.get(name.as_bytes()), Some(i as u32));
+    }
+    for name in ["p2", "p00", "p999999999999999999999999", "P01", "p"] {
+        assert_eq!(lookup.get(name.as_bytes()), None);
+    }
+}
+
+#[test]
+fn compact_event_sort_preserves_every_purchase_and_equal_timestamp() {
+    for n in [4095, 4096, 20_003] {
+        let mut state = 19_u64;
+        let rows = (0..n).map(|i| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let time = if i % 3 == 0 {
+                (1 << 31) - 1
+            } else {
+                (state >> 33) as i64
+            };
+            CompactEvent::new(time, i as u32 % 997, i as u32 % 512)
+        });
+        let mut events: Vec<_> = rows.collect();
+        let values = |events: &[CompactEvent]| {
+            let mut v: Vec<_> = events.iter().map(|e| (e.time(), e.purchase())).collect();
+            v.sort_unstable();
+            v
+        };
+        let expected = values(&events);
+        CompactEvent::sort(&mut events, &mut Vec::new());
+        assert!(events.windows(2).all(|p| p[0].time() <= p[1].time()));
+        assert_eq!(values(&events), expected);
+    }
+}
+
+#[test]
+fn chunk_reader_emits_each_physical_row_once_at_exact_boundaries() {
+    use crate::input::{Input, Reader};
+    use std::fs;
+    let temp = tempfile::tempdir().unwrap();
+    let block = 1 << 20;
+    for (file, pos) in [block - 1, block, block + 1, 2 * block + 9]
+        .into_iter()
+        .enumerate()
+    {
+        let mut bytes = vec![b'h'; pos];
+        bytes.extend_from_slice(b"\nfirst\r\n");
+        bytes.extend(std::iter::repeat_n(b'x', block * 2 + 5));
+        bytes.extend_from_slice(b"\n\nlast");
+        fs::write(temp.path().join(format!("{file}.csv")), bytes).unwrap();
+    }
+    let input = Input::open(temp.path()).unwrap();
+    let mut reader = Reader::default();
+    let mut lengths = Vec::new();
+    for chunk in input.chunks() {
+        lengths.extend(lines(reader.body(chunk).unwrap()).map(|line| line.len()));
+    }
+    assert_eq!(lengths, [6, block * 2 + 5, 0, 4].repeat(4));
+}

@@ -18,7 +18,7 @@ python scripts/compare.py .work/example-out fixtures/E3/expected
 
 For a complete dataset, pass its root and a dedicated output directory to the same runner. The scorer supplies eight vCPUs and 24 GB. The runner defaults to those limits and accepts `CPUS` and `MEM` overrides for a smaller local Docker VM. It mounts the input read-only, disables networking, uses uid 1000, caps `/tmp` at 64 MB, and mounts `/output` and `/scratch` writable.
 
-For a native build on macOS or Linux, install Rust 1.90 or later with Cargo. The image pins Rust 1.90.0 and both container base images by digest. `Cargo.lock` pins the Rust packages.
+For a native build on macOS or Linux, install Rust 1.90 or later with Cargo. The image pins Rust 1.90.0 and both container base images by digest. Its amd64 build targets x86-64-v3 for the scorer’s Intel Cascade Lake or newer processors. Native builds use the toolchain’s default CPU target. `Cargo.lock` pins the Rust packages.
 
 ~~~sh
 make native
@@ -53,11 +53,11 @@ For example, fixture E3 has a view by `u1` at 23:50 UTC on October 3 and a 1,000
 
 ## How the pipeline works
 
-1. **Resolve identities.** Union by size and path compression join every valid link while other workers parse events. Each component stores its byte-wise minimum ID independently of its tree root. This handles long chains, shared devices and names that appear only in links. Short nonzero ASCII IDs pack losslessly into 63 bits. Longer strings, Unicode and embedded zero bytes use a sharded dictionary with full byte equality.
-2. **Read and deduplicate events.** Workers claim 1 MiB ranges in read-only memory maps and align them to LF boundaries. The worker owning a line's first byte processes the entire line. SIMD locates separators and quotes in short event and click rows on x86-64 and arm64. Each structurally valid, nonempty event ID enters one hash partition. A bitmap identifies hash slots with a single row. Rows in slots hit more than once are compared by exact ID and minimum ingest time. An invalid payload still competes for the minimum, so a later valid copy cannot rescue it. Purchases require 1 through 10,000,000 cents. The 24-hour lateness cutoff is inclusive.
-3. **Form sessions.** Surviving events move into partitions by canonical person. Each partition groups by person, then sorts each person's events by millisecond time. When the manifest spans at most 2³¹ milliseconds and the catalog has at most 512 categories, each event takes 16 bytes in memory. A wider record supports larger windows and catalogs. Gaps over 1,800,000 ms start a new session. All events in a session use its UTC start day. Per-day category sums resolve revenue ties by byte order, including the fallback category `unknown`.
-4. **Attribute sessions.** Clean clicks sort by person and time, with descending byte-wise click ID within a time tie. Identical copies become adjacent and collapse. Two forward-only cursors maintain the inclusive seven-day click window for each session. The last eligible click wins. Counts and an indexed list of active campaigns give one assist per qualifying campaign per session. Without an eligible click, `organic` receives the credit.
-5. **Write the tables.** Workers aggregate person-days and campaign counters locally. Typical manifest windows use campaign counters indexed directly by day and campaign. Larger windows or catalogs use a sparse map. Eight user partitions encode Snappy Parquet in parallel, while campaign counters merge into one file. Each user row group stores IDs in one shared byte buffer during encoding. Every footer is finished before publication. A directory lock serializes publishers and temporary hard links support rollback on a rename error. Retries replace the same nine part names. Consumers should read after the process exits successfully.
+1. **Read and validate CSV.** Workers read 1 MiB ranges into reusable buffers with positional reads. The worker owning the first byte of a row follows it to LF or EOF, including rows spanning several ranges. A 64-byte SIMD scan finds line ends, commas and quotes together. Short rows validate quote pairs from these masks. Long rows use the scalar dialect parser. Each worker caches fully validated calendar dates by their exact ten input bytes. Product and campaign lookups use dense arrays for matching decimal suffixes and full byte keys for other spellings.
+2. **Link identities.** Union by size and path compression run alongside event parsing. Each component retains its byte-wise minimum name, including aliases found only in links. Nine nonzero ASCII bytes fit losslessly in 63 bits. Other IDs use a sharded dictionary that compares full strings. Stable partition bits and byte-wise ordering keep output reproducible across worker counts. A small worker-local cache resolves repeated aliases.
+3. **Deduplicate events.** All structurally valid copies with a nonempty ID compete in the same partition, including invalid payloads. Two bitmaps identify singleton hash slots. Repeated slots use full ID equality and the earliest ingest. Common view and cart candidates occupy 24 bytes. Purchases and wide time ranges retain their full payload in a separate array. Full candidate pages can be traversed in place. Only validated winners move to canonical-person partitions.
+4. **Form and attribute sessions.** A counting pass assigns each person contiguous event and click ranges and drops click-only people. Each range sorts independently. Large compact event ranges use a three-pass integer radix sort. Wide windows and catalogs retain full-width events. Identical clicks collapse. Two forward cursors maintain the inclusive seven-day window and track distinct assisting campaigns. Byte-wise click-ID ties, the 30-minute gap and UTC start day determine the final counters.
+5. **Write the tables.** Eight workers each own one user Parquet part. They group their person partitions and write completed 65,536-row batches while other partitions are still processing. Each worker reuses its campaign, category and attribution counters. Small campaign-by-day grids use dense counters and large grids use a sparse map. Campaign totals merge into one file. Writers finish all nine Snappy Parquet footers before publishing under a directory lock. Retries replace the same part names and temporary hard links support rollback if publication fails.
 
 For `E` structurally valid event copies, `C` clicks and `L` links, cleaning and hash partitioning are linear on average. Link operations are amortized near-constant. Sorting costs at most `O(E log E + C log C)`. The subsequent scan is linear in rows plus the number of distinct campaign assists counted. The implementation holds partitioned rows in RAM. Peak memory depends on row count and ID length. It assumes the specified clean lookups, valid F1 ingest timestamps, and identical click duplicates. Invalid manifest or filesystem operations exit with an error.
 
@@ -71,7 +71,7 @@ make test
 make fixtures MEM=5g
 ~~~
 
-The native suite covers strict ASCII and calendar parsing, overflow, byte ordering, all short dialect inputs over a five-byte test alphabet, and all official fixtures. Additional end-to-end tests compare 20 seeded randomized datasets with the oracle, vary worker counts, exercise multi-megabyte lines, run concurrent publishers, and retry empty or failed outputs. A 96,000-purchase stress case joins 12,000 IDs across files and checks daily revenue of 480 billion cents per day.
+The native suite covers strict ASCII and calendar parsing, date-cache collisions, compact and wide candidate boundaries, real buffer splits, radix ordering, and the official fixtures. Exhaustive short dialect inputs and malformed records at all 64 SIMD block offsets are checked against independent or scalar parsers. Additional end-to-end tests compare 20 seeded randomized datasets with the oracle, vary worker counts, exercise multi-megabyte lines, run concurrent publishers, and retry empty or failed outputs. A separate 64,000-event Unicode-ID case compares the actual Parquet bytes with one and eight workers. A 96,000-purchase stress case joins 12,000 IDs across files and checks daily revenue of 480 billion cents per day.
 
 The unmodified organizer generator is bundled as a small source archive. `make dev` needs Cargo and `unzip`. To reproduce the public dataset and compare every output row, put the competition's `dev-answer.zip` in the checkout and run the following commands.
 
@@ -93,7 +93,25 @@ python scripts/compare.py .work/oracle-dev .work/dev-answer
 
 ## Performance
 
-The current implementation was measured against `6a82323` on an Apple silicon Mac with 16 GiB of memory, Rust 1.90.0, and eight workers. The binaries alternated after a warm-up. Timings cover the full process, including Parquet output.
+On a native eight-core Apple M1 with 8 GiB of RAM, the released binary processed 20M generated events and 5M clicks (seed 73) in a median of **3.200 s**. Median process CPU time was 12.604 s and the highest measured resident set was 0.963 GiB. All 2,230,619 person-days and 28,014 campaign-days matched the previous main commit, `026f700`, including nulls and key uniqueness.
+
+Each comparison below used eight workers, one warm-up and three complete process runs per binary. The two rows were timed in separate rounds. The scorer uses the median container start-to-exit time on hidden Intel data. [Organizer scoring rules](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions)
+
+| Local comparison on seed 73 | Before | After |
+| --- | ---: | ---: |
+| Previous main to the buffered-reader and quote-validation version | 4.599 s | 3.599 s |
+| Streaming output version to the released version with paged event buffers | 3.282 s | 3.200 s |
+
+To compare a saved release binary with the current checkout, use a dedicated output directory. The comparator’s optional bucket count bounds memory on large outputs. Keys in a bucket still undergo full row comparison.
+
+~~~sh
+python scripts/benchmark.py .work/practice .work/paired --baseline /path/to/previous/eventforge --binary target/release/eventforge --runs 3
+python scripts/compare.py .work/paired/baseline .work/paired/candidate --buckets 8
+~~~
+
+### Previous revision
+
+The preceding implementation was measured against `6a82323` on an Apple silicon Mac with 16 GiB of memory, Rust 1.90.0, and eight workers. The binaries alternated after a warm-up. Timings cover the full process, including Parquet output.
 
 | Generated events | Generated clicks | Seed | Before | After | Reduction |
 | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -145,7 +163,7 @@ python scripts/check_totals.py .work/final-out
 
 | Location | Contents |
 | --- | --- |
-| `src/parse.rs`, `input.rs`, `keys.rs` | Strict field and timestamp parsing, work distribution and exact ID storage |
+| `src/csv.rs`, `parse.rs`, `input.rs`, `keys.rs` | Strict field and timestamp parsing, work distribution and exact ID storage |
 | `src/catalog.rs`, `pipeline.rs` | Dimensions, identity graph, deduplication and person partitioning |
 | `src/aggregate.rs`, `output.rs` | Sessions, attribution, daily aggregation and Parquet publication |
 | `src/tests.rs`, `tests/`, `fixtures/` | Unit tests, independent oracle, randomized and integration tests, official fixtures |

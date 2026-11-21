@@ -18,7 +18,12 @@ impl Key {
     }
 
     pub fn bucket(self, count: usize) -> usize {
-        self.mixed() as usize & (count - 1)
+        let hash = if self.0 & INDIRECT == 0 {
+            self.mixed()
+        } else {
+            self.0
+        };
+        hash as usize & (count - 1)
     }
 
     fn inline_bytes(self) -> impl Iterator<Item = u8> {
@@ -59,10 +64,17 @@ impl Keys {
             if (word | word.wrapping_sub(0x0101_0101_0101_0101)) & 0x8080_8080_8080_8080 == 0
                 && (bytes.len() == 8 || last.wrapping_sub(1) < 127)
             {
-                let pairs = (word & 0x007f_007f_007f_007f) | ((word >> 1) & 0x3f80_3f80_3f80_3f80);
-                let quads =
-                    (pairs & 0x0000_3fff_0000_3fff) | ((pairs >> 2) & 0x0fff_c000_0fff_c000);
-                let packed = (quads & 0x0fff_ffff) | ((quads >> 4) & 0x00ff_ffff_f000_0000);
+                #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+                // SAFETY: BMI2 is enabled for this build.
+                let packed = unsafe { std::arch::x86_64::_pext_u64(word, 0x7f7f_7f7f_7f7f_7f7f) };
+                #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+                let packed = {
+                    let pairs =
+                        (word & 0x007f_007f_007f_007f) | ((word >> 1) & 0x3f80_3f80_3f80_3f80);
+                    let quads =
+                        (pairs & 0x0000_3fff_0000_3fff) | ((pairs >> 2) & 0x0fff_c000_0fff_c000);
+                    (quads & 0x0fff_ffff) | ((quads >> 4) & 0x00ff_ffff_f000_0000)
+                };
                 return Key((packed << 7) | u64::from(last));
             }
             return self.intern(bytes);
@@ -85,7 +97,8 @@ impl Keys {
     fn intern(&self, bytes: &[u8]) -> Key {
         let mut hash = FxHasher::default();
         hash.write(bytes);
-        let stripe = hash.finish() as usize % STRIPES;
+        let hash = hash.finish();
+        let stripe = hash as usize % STRIPES;
         let mut strings = self.strings[stripe].lock().unwrap();
         let index = if let Some(&n) = strings.indices.get(bytes) {
             n
@@ -96,7 +109,8 @@ impl Keys {
             strings.values.push(owned);
             n
         };
-        Key(INDIRECT | (index as u64 * STRIPES as u64) | stripe as u64)
+        // Preserve stable low bits for partitioning regardless of insertion order.
+        Key(INDIRECT | ((index as u64) << 16) | (hash & 0xffff))
     }
 
     pub fn bytes(&self, key: Key) -> Vec<u8> {
@@ -110,7 +124,7 @@ impl Keys {
             out.extend(key.inline_bytes());
         } else {
             let stripe = key.0 as usize % STRIPES;
-            let index = (key.0 & !INDIRECT) as usize / STRIPES;
+            let index = ((key.0 & !INDIRECT) >> 16) as usize;
             out.extend_from_slice(&self.strings[stripe].lock().unwrap().values[index]);
         }
     }

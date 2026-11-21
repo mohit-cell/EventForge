@@ -1,52 +1,55 @@
 use anyhow::{Context, Result, ensure};
 use memchr::memchr;
-use memmap2::Mmap;
 use rayon::prelude::*;
 use std::fs::{self, File};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+const BLOCK: usize = 1 << 20;
+const LOOKAHEAD: usize = 256;
+
+struct Source {
+    path: PathBuf,
+    len: usize,
+}
+
 pub struct Input {
-    maps: Vec<Mmap>,
+    files: Vec<Source>,
 }
 
 impl Input {
     pub fn open(dir: &Path) -> Result<Self> {
-        let mut paths = Vec::<PathBuf>::new();
+        let mut files = Vec::new();
         for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
             let path = entry?.path();
-            if path.extension().is_some_and(|ext| ext == "csv") && path.is_file() {
-                paths.push(path);
+            if path.extension().is_some_and(|ext| ext == "csv") {
+                let metadata = fs::metadata(&path)?;
+                if metadata.is_file() && metadata.len() != 0 {
+                    files.push(Source {
+                        path,
+                        len: usize::try_from(metadata.len())?,
+                    });
+                }
             }
         }
-        paths.sort();
-        let mut maps = Vec::with_capacity(paths.len());
-        for path in paths {
-            let file = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
-            if file.metadata()?.len() > 0 {
-                // The input files are mounted read-only for the duration of the run.
-                maps.push(
-                    unsafe { Mmap::map(&file) }
-                        .with_context(|| format!("mapping {}", path.display()))?,
-                );
-            }
-        }
-        Ok(Self { maps })
+        files.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+        Ok(Self { files })
     }
 
     pub fn bytes(&self) -> usize {
-        self.maps.iter().map(|m| m.len()).sum()
+        self.files.iter().map(|f| f.len).sum()
     }
 
     pub fn chunks(&self) -> Vec<Chunk<'_>> {
-        const CHUNK: usize = 1 << 20;
         let mut chunks = Vec::new();
-        for map in &self.maps {
-            for start in (0..map.len()).step_by(CHUNK) {
+        for (index, file) in self.files.iter().enumerate() {
+            for start in (0..file.len).step_by(BLOCK) {
                 chunks.push(Chunk {
-                    file: map,
+                    file,
+                    index,
                     start,
-                    end: (start + CHUNK).min(map.len()),
+                    end: (start + BLOCK).min(file.len),
                 });
             }
         }
@@ -54,33 +57,65 @@ impl Input {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Chunk<'a> {
-    file: &'a [u8],
+    file: &'a Source,
+    index: usize,
     start: usize,
     end: usize,
 }
 
-impl<'a> Chunk<'a> {
-    /// Own every row whose first byte is in this interval. A worker skips a
-    /// partial first row and finishes its last row, even across several chunks.
-    /// Compute boundaries on the worker so cold page faults are parallel too.
-    pub fn body(&self) -> &'a [u8] {
-        let mut start = self.start;
-        if start == 0 || self.file[start - 1] != b'\n' {
-            let Some(lf) = memchr(b'\n', &self.file[start..self.end]) else {
-                return &[];
+#[derive(Default)]
+pub struct Reader {
+    open: Option<(usize, File)>,
+    bytes: Vec<u8>,
+}
+
+impl Reader {
+    /// A block owns rows starting inside it. Read one preceding byte and a
+    /// small lookahead so most boundaries are resolved in a single pread.
+    pub fn body(&mut self, chunk: Chunk<'_>) -> Result<&[u8]> {
+        let source = chunk.file;
+        if self.open.as_ref().map(|(i, _)| *i) != Some(chunk.index) {
+            self.open = Some((
+                chunk.index,
+                File::open(&source.path)
+                    .with_context(|| format!("opening {}", source.path.display()))?,
+            ));
+        }
+        let file = &self.open.as_ref().unwrap().1;
+        let base = chunk.start.saturating_sub(1);
+        let boundary = chunk.end - base;
+        let mut filled = (source.len - base).min(boundary + LOOKAHEAD);
+        if self.bytes.len() < filled {
+            self.bytes.resize(filled, 0);
+        }
+        file.read_exact_at(&mut self.bytes[..filled], base as u64)?;
+        let mut start = chunk.start - base;
+        if chunk.start == 0 || self.bytes[0] != b'\n' {
+            let Some(lf) = memchr(b'\n', &self.bytes[start..boundary]) else {
+                return Ok(&[]);
             };
             start += lf + 1;
         }
-        if start == self.end {
-            return &[];
+        if start == boundary || chunk.end == source.len || self.bytes[boundary - 1] == b'\n' {
+            return Ok(&self.bytes[start..boundary]);
         }
-        let end = if self.end == self.file.len() || self.file[self.end - 1] == b'\n' {
-            self.end
-        } else {
-            memchr(b'\n', &self.file[self.end..]).map_or(self.file.len(), |n| self.end + n + 1)
-        };
-        &self.file[start..end]
+        let mut search = boundary;
+        loop {
+            if let Some(lf) = memchr(b'\n', &self.bytes[search..filled]) {
+                return Ok(&self.bytes[start..search + lf + 1]);
+            }
+            if base + filled == source.len {
+                return Ok(&self.bytes[start..filled]);
+            }
+            search = filled;
+            filled = (filled + BLOCK).min(source.len - base);
+            if self.bytes.len() < filled {
+                self.bytes.resize(filled, 0);
+            }
+            file.read_exact_at(&mut self.bytes[search..filled], (base + search) as u64)?;
+        }
     }
 }
 
@@ -111,11 +146,15 @@ pub fn empty_buckets<T>(n: usize) -> Vec<Vec<T>> {
 pub type Shards<T> = Vec<Vec<Vec<T>>>;
 
 /// Move the worker-local buffers into shard order without copying their rows.
-pub fn transpose<T>(workers: Vec<Vec<Vec<T>>>, bins: usize) -> Shards<T> {
+pub fn transpose<B>(
+    workers: Vec<Vec<B>>,
+    bins: usize,
+    is_empty: impl Fn(&B) -> bool,
+) -> Vec<Vec<B>> {
     let mut result = empty_buckets(bins);
     for worker in workers {
         for (part, rows) in result.iter_mut().zip(worker) {
-            if !rows.is_empty() {
+            if !is_empty(&rows) {
                 part.push(rows);
             }
         }
@@ -123,45 +162,56 @@ pub fn transpose<T>(workers: Vec<Vec<Vec<T>>>, bins: usize) -> Shards<T> {
     result
 }
 
-pub fn partition<T: Send>(
+pub trait Bucket<T>: Default + Send {
+    fn push(&mut self, row: T);
+    fn is_empty(&self) -> bool;
+}
+
+impl<T: Send> Bucket<T> for Vec<T> {
+    fn push(&mut self, row: T) {
+        Vec::push(self, row);
+    }
+    fn is_empty(&self) -> bool {
+        Vec::is_empty(self)
+    }
+}
+
+pub fn partition<const N: usize, T, B: Bucket<T>, F>(
     input: &Input,
     bins: usize,
-    parse: impl Fn(&[u8]) -> Option<(usize, T)> + Sync,
-) -> Shards<T> {
+    make_parser: impl Fn() -> F + Sync,
+) -> Result<Vec<Vec<B>>>
+where
+    F: FnMut([&[u8]; N]) -> Option<(usize, T)>,
+{
     let chunks = input.chunks();
     let next = AtomicUsize::new(0);
     let workers = rayon::current_num_threads().min(chunks.len());
     let buffers = (0..workers)
         .into_par_iter()
         .map(|_| {
-            let mut parts = empty_buckets(bins);
+            let mut parts: Vec<B> = (0..bins).map(|_| B::default()).collect();
+            let mut reader = Reader::default();
+            let mut parse = make_parser();
             while let Some(chunk) = chunks.get(next.fetch_add(1, Ordering::Relaxed)) {
-                for line in lines(chunk.body()) {
-                    if let Some((bin, row)) = parse(line) {
+                crate::csv::records(reader.body(*chunk)?, |fields| {
+                    if let Some((bin, row)) = parse(fields) {
                         parts[bin].push(row);
                     }
-                }
+                });
             }
-            parts
+            Ok(parts)
         })
-        .collect();
-    transpose(buffers, bins)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(transpose(buffers, bins, B::is_empty))
 }
 
-pub fn dimension(path: &Path) -> Result<Vec<(String, String)>> {
-    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+pub fn dimension(data: &[u8]) -> Result<Vec<(&str, &str)>> {
     let mut rows = Vec::new();
-    for line in lines(after_header(&bytes)) {
+    for line in lines(after_header(data)) {
         let [key, value] = crate::parse::fields(line).context("malformed lookup row")?;
-        ensure!(
-            !key.is_empty() && !value.is_empty(),
-            "empty lookup in {}",
-            path.display()
-        );
-        rows.push((
-            std::str::from_utf8(key)?.to_owned(),
-            std::str::from_utf8(value)?.to_owned(),
-        ));
+        ensure!(!key.is_empty() && !value.is_empty(), "empty lookup field");
+        rows.push((std::str::from_utf8(key)?, std::str::from_utf8(value)?));
     }
     Ok(rows)
 }

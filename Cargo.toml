@@ -8,7 +8,6 @@ publish = false
 [dependencies]
 anyhow = "1.0"
 memchr = "2.7"
-memmap2 = "0.9"
 parquet = { version = "=56.2.0", default-features = false, features = ["snap"] }
 rayon = "1.10"
 rustc-hash = "2.1"

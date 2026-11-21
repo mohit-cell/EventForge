@@ -1,6 +1,8 @@
-use crate::aggregate::{Campaigns, Summary, UserDay};
+use crate::aggregate::{self, Campaigns, PersonShard, UserDay};
 use crate::catalog::Catalog;
+use crate::input::Shards;
 use crate::keys::{Key, Keys};
+use crate::pipeline::{Click, Event, EventPayload};
 use anyhow::{Context, Result, bail};
 use parquet::basic::Compression;
 use parquet::data_type::{ByteArray, ByteArrayType, DataType, Int32Type, Int64Type};
@@ -103,26 +105,36 @@ fn user_batch(
 
 const USER_PARTS: usize = 8;
 
-fn user_file(
+fn user_file<P: EventPayload>(
     dir: &Path,
-    shards: Vec<Vec<UserDay>>,
+    shards: Vec<PersonShard<P>>,
     keys: &Keys,
-    categories: &[ByteArray],
-) -> Result<NamedTempFile> {
+    catalog: &Catalog,
+) -> Result<(NamedTempFile, Campaigns, usize)> {
     let (temp, mut writer) = file(dir, USER)?;
-    let mut batch = Vec::new();
-    for row in shards.into_iter().flatten() {
-        batch.push(row);
-        if batch.len() == BATCH {
-            user_batch(&mut writer, &batch, keys, categories)?;
-            batch.clear();
+    let categories: Vec<_> = catalog
+        .categories
+        .iter()
+        .map(|name| ByteArray::from(name.as_str()))
+        .collect();
+    let mut count = 0;
+    let summary = aggregate::summarize(shards, keys, catalog, |rows| {
+        let written = rows.len() / BATCH * BATCH;
+        for batch in rows[..written].chunks(BATCH) {
+            user_batch(&mut writer, batch, keys, &categories)?;
         }
-    }
-    if !batch.is_empty() {
-        user_batch(&mut writer, &batch, keys, categories)?;
+        if written != 0 {
+            rows.drain(..written);
+            count += written;
+        }
+        Ok(())
+    })?;
+    if !summary.users.is_empty() {
+        user_batch(&mut writer, &summary.users, keys, &categories)?;
+        count += summary.users.len();
     }
     writer.close()?;
-    Ok(temp)
+    Ok((temp, summary.campaigns, count))
 }
 
 fn campaign_file(
@@ -136,15 +148,25 @@ fn campaign_file(
         .reduce_with(Campaigns::merge)
         .map_or_else(Vec::new, Campaigns::into_rows);
     rows.sort_unstable_by_key(|r| r.0);
+    let labels: Vec<_> = catalog
+        .campaigns
+        .iter()
+        .map(|(name, channel)| {
+            (
+                ByteArray::from(name.as_str()),
+                ByteArray::from(channel.as_str()),
+            )
+        })
+        .collect();
     for rows in rows.chunks(BATCH) {
         let mut group = campaigns.next_row_group()?;
         let names = rows
             .iter()
-            .map(|((id, _), _)| ByteArray::from(catalog.campaigns[*id as usize].0.as_str()))
+            .map(|((id, _), _)| labels[*id as usize].0.clone())
             .collect();
         let channels = rows
             .iter()
-            .map(|((id, _), _)| ByteArray::from(catalog.campaigns[*id as usize].1.as_str()))
+            .map(|((id, _), _)| labels[*id as usize].1.clone())
             .collect();
         column::<ByteArrayType>(&mut group, names, None)?;
         column::<ByteArrayType>(&mut group, channels, None)?;
@@ -222,38 +244,32 @@ fn publish(root: &Path, files: Vec<(NamedTempFile, PathBuf)>) -> Result<()> {
     Ok(())
 }
 
-pub fn write(
+pub fn write<P: EventPayload>(
     root: &Path,
-    results: Vec<Summary>,
+    events: Shards<Event<P>>,
+    clicks: Shards<Click>,
     keys: &Keys,
     catalog: &Catalog,
 ) -> Result<(usize, usize)> {
     let user_dir = root.join("user_daily");
     let camp_dir = root.join("campaign_daily");
-    let mut users: [Vec<Vec<UserDay>>; USER_PARTS] = std::array::from_fn(|_| Vec::new());
-    let mut partials = Vec::with_capacity(results.len());
-    let mut nusers = 0;
-    for (index, summary) in results.into_iter().enumerate() {
-        nusers += summary.users.len();
-        users[index % USER_PARTS].push(summary.users);
-        partials.push(summary.campaigns);
+    let mut parts: [Vec<PersonShard<P>>; USER_PARTS] = std::array::from_fn(|_| Vec::new());
+    for (i, shard) in events.into_iter().zip(clicks).enumerate() {
+        parts[i % USER_PARTS].push(shard);
     }
-    let categories: Vec<_> = catalog
-        .categories
-        .iter()
-        .map(|s| ByteArray::from(s.as_str()))
-        .collect();
-    let (user_files, campaign) = rayon::join(
-        || {
-            users
-                .into_par_iter()
-                .map(|shards| user_file(&user_dir, shards, keys, &categories))
-                .collect::<Result<Vec<_>>>()
-        },
-        || campaign_file(&camp_dir, partials, catalog),
-    );
-    let user_files = user_files?;
-    let (campaign, ncampaigns) = campaign?;
+    let finished = parts
+        .into_par_iter()
+        .map(|shards| user_file(&user_dir, shards, keys, catalog))
+        .collect::<Result<Vec<_>>>()?;
+    let mut user_files = Vec::with_capacity(USER_PARTS);
+    let mut partials = Vec::with_capacity(USER_PARTS);
+    let mut nusers = 0;
+    for (file, campaigns, count) in finished {
+        user_files.push(file);
+        partials.push(campaigns);
+        nusers += count;
+    }
+    let (campaign, ncampaigns) = campaign_file(&camp_dir, partials, catalog)?;
     // All footers are complete before publishing. Fixed part names also replace
     // output from a prior run, even when a later input is empty.
     let mut files: Vec<_> = user_files

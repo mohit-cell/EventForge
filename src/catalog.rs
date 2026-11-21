@@ -1,8 +1,8 @@
-use crate::input::{Input, dimension, lines};
+use crate::input::{Input, Reader, dimension};
 use crate::keys::{Key, Keys};
-use crate::parse::{fields, utc};
+use crate::parse::DateCache;
 use anyhow::{Context, Result, ensure};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Deserialize;
 use std::collections::hash_map::Entry;
 use std::path::Path;
@@ -13,13 +13,74 @@ struct Manifest {
     window_end: String,
 }
 
+/// Dense indices cover IDs with a shared prefix and canonical decimal suffix.
+/// Sparse keys retain their exact spelling, including leading zeroes.
+pub struct Lookup {
+    prefix: Vec<u8>,
+    dense: Vec<u32>,
+    sparse: FxHashMap<Vec<u8>, u32>,
+}
+
+impl Lookup {
+    pub fn new<'a>(mut rows: impl ExactSizeIterator<Item = (&'a str, u32)>) -> Self {
+        let limit = rows.len().saturating_mul(2).min(1 << 24);
+        let first = rows.next();
+        let name = first.map_or("", |(s, _)| s).as_bytes();
+        let split = name
+            .iter()
+            .rposition(|c| !c.is_ascii_digit())
+            .map_or(0, |i| i + 1);
+        let mut lookup = Self {
+            prefix: name[..split].to_vec(),
+            dense: Vec::new(),
+            sparse: FxHashMap::default(),
+        };
+        for (name, value) in first.into_iter().chain(rows) {
+            if let Some(i) = lookup.index(name.as_bytes()).filter(|&i| i < limit) {
+                if i >= lookup.dense.len() {
+                    lookup.dense.resize(i + 1, u32::MAX);
+                }
+                lookup.dense[i] = value;
+            } else {
+                lookup.sparse.insert(name.as_bytes().to_vec(), value);
+            }
+        }
+        lookup
+    }
+
+    #[inline]
+    fn index(&self, name: &[u8]) -> Option<usize> {
+        let digits = name.strip_prefix(self.prefix.as_slice())?;
+        if digits.is_empty() || digits.len() > 8 || (digits[0] == b'0' && digits.len() != 1) {
+            return None;
+        }
+        let mut value = 0;
+        for &c in digits {
+            let digit = c.wrapping_sub(b'0');
+            if digit >= 10 {
+                return None;
+            }
+            value = value * 10 + usize::from(digit);
+        }
+        Some(value)
+    }
+
+    #[inline]
+    pub fn get(&self, name: &[u8]) -> Option<u32> {
+        if let Some(&value) = self.index(name).and_then(|i| self.dense.get(i)) {
+            return (value != u32::MAX).then_some(value);
+        }
+        self.sparse.get(name).copied()
+    }
+}
+
 pub struct Catalog {
     pub start: i64,
     pub end: i64,
-    pub products: FxHashMap<Vec<u8>, u32>,
+    pub products: Lookup,
     pub categories: Vec<String>,
     pub unknown: u32,
-    pub campaign_ids: FxHashMap<Vec<u8>, u32>,
+    pub campaign_ids: Lookup,
     pub campaigns: Vec<(String, String)>,
 }
 
@@ -29,33 +90,47 @@ impl Catalog {
         let manifest: Manifest = serde_json::from_slice(
             &std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?,
         )?;
-        let start = utc(manifest.window_start.as_bytes()).context("invalid window_start")?;
-        let end = utc(manifest.window_end.as_bytes()).context("invalid window_end")?;
+        let mut dates = DateCache::default();
+        let start = dates
+            .utc(manifest.window_start.as_bytes())
+            .context("invalid window_start")?;
+        let end = dates
+            .utc(manifest.window_end.as_bytes())
+            .context("invalid window_end")?;
         ensure!(start < end, "empty or reversed manifest window");
-        let rows = dimension(&root.join("products.csv"))?;
-        let mut categories: Vec<_> = rows.iter().map(|(_, c)| c.clone()).collect();
-        categories.push("unknown".to_owned());
+        let read = |name| {
+            let path = root.join(name);
+            std::fs::read(&path).with_context(|| format!("reading {}", path.display()))
+        };
+        let bytes = read("products.csv")?;
+        let rows = dimension(&bytes).context("reading products.csv")?;
+        let mut names: FxHashSet<_> = rows.iter().map(|&(_, c)| c).collect();
+        names.insert("unknown");
+        let mut categories: Vec<String> = names.into_iter().map(str::to_owned).collect();
         categories.sort_unstable();
-        categories.dedup();
         let ids: FxHashMap<&str, u32> = categories
             .iter()
             .enumerate()
             .map(|(i, c)| (c.as_str(), i as u32))
             .collect();
         let unknown = ids["unknown"];
-        let products = rows
-            .into_iter()
-            .map(|(p, c)| (p.into_bytes(), ids[c.as_str()]))
-            .collect();
+        let products = Lookup::new(rows.into_iter().map(|(p, c)| (p, ids[c])));
 
         let mut campaigns = vec![("organic".to_owned(), "organic".to_owned())];
-        campaigns.extend(dimension(&root.join("campaigns.csv"))?);
-        let campaign_ids = campaigns
-            .iter()
-            .enumerate()
-            .skip(1)
-            .map(|(id, (name, _))| (name.as_bytes().to_vec(), id as u32))
-            .collect();
+        let bytes = read("campaigns.csv")?;
+        campaigns.extend(
+            dimension(&bytes)
+                .context("reading campaigns.csv")?
+                .into_iter()
+                .map(|(name, channel)| (name.to_owned(), channel.to_owned())),
+        );
+        let campaign_ids = Lookup::new(
+            campaigns
+                .iter()
+                .enumerate()
+                .skip(1)
+                .map(|(i, (name, _))| (name.as_str(), i as u32)),
+        );
         Ok(Self {
             start,
             end,
@@ -118,6 +193,31 @@ impl Components {
 
 pub type People = FxHashMap<Key, Key>;
 
+/// Frequent aliases can be resolved without revisiting the shared graph table.
+pub struct Resolver<'a> {
+    aliases: &'a People,
+    slots: Vec<(Key, Key)>,
+}
+
+impl<'a> Resolver<'a> {
+    pub fn new(aliases: &'a People) -> Self {
+        Self {
+            aliases,
+            slots: vec![(Key::EMPTY, Key::EMPTY); 1024],
+        }
+    }
+
+    #[inline]
+    pub fn get(&mut self, id: Key) -> Key {
+        let index = id.bucket(self.slots.len());
+        let slot = &mut self.slots[index];
+        if slot.0 != id {
+            *slot = (id, self.aliases.get(&id).copied().unwrap_or(id));
+        }
+        slot.1
+    }
+}
+
 pub fn people(data: &Path, keys: &Keys) -> Result<People> {
     let input = Input::open(&data.join("links"))?;
     // Typical links have two short IDs. Reserving up front avoids repeatedly
@@ -129,15 +229,13 @@ pub fn people(data: &Path, keys: &Keys) -> Result<People> {
         size: Vec::with_capacity(estimated_aliases),
         smallest: Vec::with_capacity(estimated_aliases),
     };
+    let mut reader = Reader::default();
     for chunk in input.chunks() {
-        for row in lines(chunk.body()) {
-            if let Some([a, b]) = fields(row)
-                && !a.is_empty()
-                && !b.is_empty()
-            {
+        crate::csv::records(reader.body(chunk)?, |[a, b]| {
+            if !a.is_empty() && !b.is_empty() {
                 sets.join(keys.get(a), keys.get(b), keys);
             }
-        }
+        });
     }
     let mut people = People::with_capacity_and_hasher(
         sets.parent

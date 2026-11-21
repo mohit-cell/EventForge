@@ -1,5 +1,6 @@
 mod aggregate;
 mod catalog;
+mod csv;
 mod input;
 mod keys;
 mod output;
@@ -7,11 +8,11 @@ mod parse;
 mod pipeline;
 
 use anyhow::{Context, Result, ensure};
-use catalog::Catalog;
+use catalog::{Catalog, Resolver};
 use input::Input;
 use keys::Keys;
+use parse::DateCache;
 use pipeline::{CompactEvent, EventPayload, WideEvent};
-use rayon::prelude::*;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -52,32 +53,33 @@ fn process<P: EventPayload>(
     let (people, candidates) = rayon::join(
         || catalog::people(data, keys),
         || {
-            input::partition(&input, bins, |line| {
-                pipeline::candidate::<P>(line, keys, catalog, bins)
+            input::partition(&input, bins, || {
+                let mut dates = DateCache::default();
+                move |fields: [&[u8]; 7]| {
+                    pipeline::candidate::<P>(fields, &mut dates, keys, catalog, bins)
+                }
             })
         },
     );
     let people = people?;
     drop(input);
     timer.report("dimensions, links and event parsing");
-    let events = pipeline::deduplicate(candidates, &people, bins);
+    let events = pipeline::deduplicate(candidates?, &people, bins);
     timer.report("deduplicate and partition people");
 
     let input = Input::open(&data.join("clicks"))?;
-    let clicks = input::partition(&input, bins, |line| {
-        pipeline::click(line, keys, catalog, &people, bins)
-    });
+    let clicks = input::partition(&input, bins, || {
+        let mut dates = DateCache::default();
+        let mut resolver = Resolver::new(&people);
+        move |fields: [&[u8]; 4]| {
+            pipeline::click(fields, &mut dates, keys, catalog, &mut resolver, bins)
+        }
+    })?;
     drop(input);
     drop(people);
     timer.report("parse clicks");
-    let results: Vec<_> = events
-        .into_par_iter()
-        .zip(clicks)
-        .map(|(events, clicks)| aggregate::summarize(events, clicks, keys, catalog))
-        .collect();
-    timer.report("sort, sessionize and attribute");
-    let counts = output::write(output, results, keys, catalog)?;
-    timer.report("write parquet");
+    let counts = output::write(output, events, clicks, keys, catalog)?;
+    timer.report("group, sessionize, attribute and write parquet");
     eprintln!("{} person-days, {} campaign-days", counts.0, counts.1);
     Ok(())
 }

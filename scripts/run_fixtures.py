@@ -30,7 +30,7 @@ def load_expected(path, schema):
     return df.with_columns(pl.col("day").str.to_date())
 
 
-def load_actual(folder, schema):
+def load_actual(folder, schema, predicate=None):
     folder = Path(folder)
     if folder.is_symlink() or not folder.is_dir():
         raise ValueError(f"expected an output directory: {folder}")
@@ -38,7 +38,10 @@ def load_actual(folder, schema):
     for path in sorted(folder.glob("*.parquet")):
         if path.name.startswith((".", "_")) or path.is_symlink() or not path.is_file():
             continue
-        frame = pl.read_parquet(path)
+        if predicate is None:
+            frame = pl.read_parquet(path)
+        else:
+            frame = pl.scan_parquet(path).filter(predicate).collect(engine="streaming")
         if set(frame.columns) != set(schema):
             raise ValueError(f"{path}: expected {list(schema)}, got {frame.columns}")
         for column, expected in schema.items():

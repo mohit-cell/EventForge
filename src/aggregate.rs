@@ -1,7 +1,8 @@
 use crate::catalog::Catalog;
 use crate::keys::{Key, Keys};
 use crate::parse::{DAY, GAP, WEEK};
-use crate::pipeline::{Click, Event, EventPayload};
+use crate::pipeline::{Click, Event, EventPayload, PersonClick};
+use anyhow::Result;
 use rustc_hash::FxHashMap;
 
 #[derive(Default)]
@@ -200,15 +201,16 @@ impl Active {
 }
 
 fn person<P: EventPayload>(
-    events: &[Event<P>],
-    clicks: &[Click],
+    who: Key,
+    events: &[P],
+    clicks: &[PersonClick],
     origin: i64,
     spend: &mut Spend,
     active: &mut Active,
     out: &mut Summary,
 ) {
     let new_day = |day| UserDay {
-        person: events[0].person,
+        person: who,
         day,
         ..Default::default()
     };
@@ -262,32 +264,108 @@ fn person<P: EventPayload>(
     active.reset();
 }
 
-fn gather<T>(parts: Vec<Vec<T>>) -> Vec<T> {
-    let mut parts = parts.into_iter();
-    let mut rows = parts.next().unwrap_or_default();
-    rows.reserve_exact(parts.as_slice().iter().map(Vec::len).sum());
-    for mut part in parts {
-        rows.append(&mut part);
+#[derive(Default)]
+struct Group {
+    person: Key,
+    events: usize,
+    clicks: usize,
+    event_cursor: usize,
+    click_cursor: usize,
+}
+
+pub type PersonShard<P> = (Vec<Vec<Event<P>>>, Vec<Vec<Click>>);
+
+/// Count and scatter into contiguous person ranges. The second pass uses
+/// recorded group indices, so each source row needs just one dictionary probe.
+fn summarize_shard<P: EventPayload>(
+    (events, clicks): PersonShard<P>,
+    keys: &Keys,
+    catalog: &Catalog,
+    spend: &mut Spend,
+    active: &mut Active,
+    summary: &mut Summary,
+) {
+    let n: usize = events.iter().map(Vec::len).sum();
+    if n == 0 {
+        return;
     }
-    rows
+    let mut map = FxHashMap::with_capacity_and_hasher(n / 32 + 1, Default::default());
+    let mut groups: Vec<Group> = Vec::with_capacity(n / 32 + 1);
+    let mut indices = Vec::with_capacity(n);
+    for event in events.iter().flatten() {
+        let i = *map.entry(event.person).or_insert_with(|| {
+            let i = groups.len();
+            groups.push(Group {
+                person: event.person,
+                ..Default::default()
+            });
+            i
+        });
+        groups[i].events += 1;
+        indices.push(i);
+    }
+    let mut click_indices = Vec::with_capacity(clicks.iter().map(Vec::len).sum());
+    for click in clicks.iter().flatten() {
+        let i = map.get(&click.person).copied().unwrap_or(usize::MAX);
+        if i != usize::MAX {
+            groups[i].clicks += 1;
+        }
+        click_indices.push(i);
+    }
+    let (mut ne, mut nc) = (0, 0);
+    for group in &mut groups {
+        group.event_cursor = ne;
+        group.click_cursor = nc;
+        ne += group.events;
+        nc += group.clicks;
+    }
+    let mut times = vec![P::default(); ne];
+    for (event, i) in events.into_iter().flatten().zip(indices) {
+        let cursor = &mut groups[i].event_cursor;
+        times[*cursor] = event.payload;
+        *cursor += 1;
+    }
+    let mut visits = vec![PersonClick::default(); nc];
+    for (click, i) in clicks.into_iter().flatten().zip(click_indices) {
+        if i != usize::MAX {
+            let cursor = &mut groups[i].click_cursor;
+            visits[*cursor] = click.data;
+            *cursor += 1;
+        }
+    }
+    groups.sort_unstable_by(|a, b| keys.compare(a.person, b.person));
+    let mut scratch = Vec::new();
+    for group in groups {
+        let events = &mut times[group.event_cursor - group.events..group.event_cursor];
+        let clicks = &mut visits[group.click_cursor - group.clicks..group.click_cursor];
+        P::sort(events, &mut scratch);
+        clicks.sort_unstable_by(|a, b| a.time.cmp(&b.time).then_with(|| keys.compare(b.id, a.id)));
+        // Identical click copies are adjacent. Compact the range in place.
+        let mut distinct = 0;
+        for i in 0..clicks.len() {
+            if distinct == 0 || clicks[distinct - 1].id != clicks[i].id {
+                clicks[distinct] = clicks[i];
+                distinct += 1;
+            }
+        }
+        person(
+            group.person,
+            events,
+            &clicks[..distinct],
+            catalog.start,
+            spend,
+            active,
+            summary,
+        );
+    }
 }
 
 pub fn summarize<P: EventPayload>(
-    events: Vec<Vec<Event<P>>>,
-    clicks: Vec<Vec<Click>>,
+    shards: Vec<PersonShard<P>>,
     keys: &Keys,
     catalog: &Catalog,
-) -> Summary {
-    let mut events = gather(events);
-    let mut clicks = gather(clicks);
-    events.sort_unstable_by_key(|e| e.person);
-    // The last eligible click must have the smallest byte ID among ties.
-    clicks.sort_unstable_by_key(|c| c.person);
-    for group in clicks.chunk_by_mut(|a, b| a.person == b.person) {
-        group.sort_unstable_by(|a, b| a.time.cmp(&b.time).then_with(|| keys.compare(b.id, a.id)));
-    }
-    clicks.dedup_by(|a, b| a.id == b.id && a.person == b.person && a.time == b.time);
-
+    mut flush: impl FnMut(&mut Vec<UserDay>) -> Result<()>,
+) -> Result<Summary> {
     let mut out = Summary {
         users: Vec::new(),
         campaigns: Campaigns::new(catalog),
@@ -297,24 +375,9 @@ pub fn summarize<P: EventPayload>(
         used: Vec::new(),
     };
     let mut active = Active::new(catalog.campaigns.len());
-    let mut remaining = clicks.as_slice();
-    for rows in events.chunk_by_mut(|a, b| a.person == b.person) {
-        rows.sort_unstable_by_key(|e| e.time());
-        let who = rows[0].person;
-        while remaining.first().is_some_and(|c| c.person < who) {
-            remaining = &remaining[1..];
-        }
-        let count = remaining.iter().take_while(|c| c.person == who).count();
-        let (eligible_person, rest) = remaining.split_at(count);
-        person(
-            rows,
-            eligible_person,
-            catalog.start,
-            &mut spend,
-            &mut active,
-            &mut out,
-        );
-        remaining = rest;
+    for shard in shards {
+        summarize_shard(shard, keys, catalog, &mut spend, &mut active, &mut out);
+        flush(&mut out.users)?;
     }
-    out
+    Ok(out)
 }

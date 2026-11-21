@@ -113,6 +113,27 @@ class PipelineTests(unittest.TestCase):
                 if seed in (0, 1):
                     self.assertEqual(production(data, out, 8 if seed % 2 else 1), expected)
 
+    def test_parquet_bytes_stable_across_workers_for_interned_people(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            data = root / "data"
+            setup_data(data)
+            users = [f"shopper-商-{i:04d}".encode() for i in range(257)]
+            stamp = iso(BASE)
+            for part in range(4):
+                rows = []
+                for i in range(16_000):
+                    user = users[(i * 13 + part * 79) % len(users)]
+                    event = f"event-{part}-{i:05d}".encode()
+                    rows.append(b",".join([event, user, stamp, stamp, b"view", b"p1", b""]))
+                write_part(data, "events", part, rows)
+            first, second = root / "one", root / "eight"
+            expected = production(data, first, 1)
+            self.assertEqual(sum(row[3] for row in expected["user_daily"]), 64_000)
+            self.assertEqual(production(data, second, 8), expected)
+            for path in first.glob("*/*.parquet"):
+                self.assertEqual(path.read_bytes(), (second / path.relative_to(first)).read_bytes())
+
     def test_empty_rerun_replaces_previous_tables(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
