@@ -121,7 +121,11 @@ fn exact_key_equality_roundtrip_and_byte_order() {
         b"a\0",
         b"a\0b",
         b"\t",
+        b"12345678",
         b"123456789",
+        b"1234\x00567",
+        b"12345678\0",
+        "xé12345".as_bytes(),
         b"1234567890",
         b"1234567891",
         b"12345678900",
@@ -167,6 +171,22 @@ fn dialect_matches_independent_splitter_exhaustively() {
             assert_eq!(fields::<2>(&row), reference::<2>(&row), "{row:?}");
             assert_eq!(fields::<4>(&row), reference::<4>(&row), "{row:?}");
             assert_eq!(fields::<7>(&row), reference::<7>(&row), "{row:?}");
+        }
+    }
+
+    // Move delimiters and quote pairs across vector boundaries and through
+    // the overlapping final block, including the scalar fallback threshold.
+    for pad in 0..=128 {
+        let mut row = vec![b'x'; pad];
+        row.extend_from_slice(b",\"a\",\"\",zz,99,\"x\",\r");
+        assert_eq!(fields::<7>(&row), reference::<7>(&row));
+        for position in 0..row.len() {
+            let original = row[position];
+            for byte in [b',', b'"'] {
+                row[position] = byte;
+                assert_eq!(fields::<7>(&row), reference::<7>(&row), "{row:?}");
+            }
+            row[position] = original;
         }
     }
 }

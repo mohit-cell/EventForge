@@ -4,7 +4,6 @@ use crate::keys::{Key, Keys};
 use crate::parse::{DAY, WEEK, fields, price, timestamp, utc};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
-use std::collections::hash_map::Entry;
 
 #[derive(Clone, Copy, Default)]
 pub struct Event {
@@ -72,28 +71,51 @@ pub fn deduplicate(
     people: &People,
     bins: usize,
 ) -> Vec<Vec<Vec<Event>>> {
-    let workers = shards
+    let mut groups = empty_buckets(rayon::current_num_threads().min(shards.len()));
+    let workers = groups.len();
+    for (index, parts) in shards.into_iter().enumerate() {
+        groups[index % workers].push(parts);
+    }
+    let workers = groups
         .into_par_iter()
-        .map(|parts| {
-            let capacity = parts.iter().map(Vec::len).sum();
-            let mut earliest = FxHashMap::with_capacity_and_hasher(capacity, Default::default());
-            for (id, row) in parts.into_iter().flatten() {
-                match earliest.entry(id) {
-                    Entry::Vacant(slot) => {
-                        slot.insert(row);
-                    }
-                    Entry::Occupied(mut slot) if row.ingest < slot.get().ingest => {
-                        slot.insert(row);
-                    }
-                    _ => {}
-                }
-            }
+        .map(|group| {
             let mut events = empty_buckets(bins);
-            for row in earliest.into_values() {
-                let mut event = row.event;
+            let mut route = |mut event: Event| {
                 if event.person != Key::EMPTY {
                     event.person = *people.get(&event.person).unwrap_or(&event.person);
                     events[event.person.bucket(bins)].push(event);
+                }
+            };
+            for parts in group {
+                let count: usize = parts.iter().map(Vec::len).sum();
+                // Use at least eight hash slots per candidate. A singleton slot
+                // proves its ID is unique; repeated slots need full Key equality.
+                let words = count.div_ceil(8).next_power_of_two();
+                let mut hits = vec![[0u64; 2]; words];
+                let slot = |id: Key| {
+                    let hash = id.mixed() >> bins.trailing_zeros();
+                    ((hash >> 6) as usize & (words - 1), 1u64 << (hash & 63))
+                };
+                for &(id, _) in parts.iter().flatten() {
+                    let (word, bit) = slot(id);
+                    let [seen, repeated] = &mut hits[word];
+                    *repeated |= *seen & bit;
+                    *seen |= bit;
+                }
+                let mut earliest = FxHashMap::<Key, Candidate>::default();
+                for (id, row) in parts.into_iter().flatten() {
+                    let (word, bit) = slot(id);
+                    if hits[word][1] & bit == 0 {
+                        route(row.event);
+                    } else {
+                        let first = earliest.entry(id).or_insert(row);
+                        if row.ingest < first.ingest {
+                            *first = row;
+                        }
+                    }
+                }
+                for row in earliest.into_values() {
+                    route(row.event);
                 }
             }
             events

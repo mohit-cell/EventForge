@@ -23,7 +23,13 @@ pub struct CampaignDay {
 }
 
 impl CampaignDay {
-    pub fn merge(&mut self, other: &Self) {
+    fn credit(&mut self, revenue: i64) {
+        self.sessions += 1;
+        self.revenue += revenue;
+        self.purchasing += i64::from(revenue > 0);
+    }
+
+    fn merge(&mut self, other: &Self) {
         self.sessions += other.sessions;
         self.purchasing += other.purchasing;
         self.revenue += other.revenue;
@@ -31,9 +37,90 @@ impl CampaignDay {
     }
 }
 
-pub type Campaigns = FxHashMap<(u32, i32), CampaignDay>;
+pub enum Campaigns {
+    Dense {
+        first_day: i32,
+        width: usize,
+        rows: Vec<CampaignDay>,
+    },
+    Sparse(FxHashMap<(u32, i32), CampaignDay>),
+}
 
-#[derive(Default)]
+impl Campaigns {
+    fn new(catalog: &Catalog) -> Self {
+        let first_day = catalog.start.div_euclid(DAY) as i32;
+        let days = (catalog.end - 1).div_euclid(DAY) as i32 - first_day + 1;
+        let width = catalog.campaigns.len();
+        // Bound the per-partition allocation when the manifest spans many days
+        // or there are too many campaigns for a small direct-indexed table.
+        if let Some(size @ ..=32_768) = width.checked_mul(days as usize) {
+            Self::Dense {
+                first_day,
+                width,
+                rows: vec![CampaignDay::default(); size],
+            }
+        } else {
+            Self::Sparse(FxHashMap::default())
+        }
+    }
+
+    fn record(&mut self, day: i32, winner: u32, revenue: i64, assists: &[u32]) {
+        match self {
+            Self::Dense {
+                first_day,
+                width,
+                rows,
+            } => {
+                let start = (day - *first_day) as usize * *width;
+                let day = &mut rows[start..start + *width];
+                for &campaign in assists {
+                    day[campaign as usize].assists += 1;
+                }
+                day[winner as usize].credit(revenue);
+            }
+            Self::Sparse(rows) => {
+                for &campaign in assists {
+                    rows.entry((campaign, day)).or_default().assists += 1;
+                }
+                rows.entry((winner, day)).or_default().credit(revenue);
+            }
+        }
+    }
+
+    pub fn merge(mut self, other: Self) -> Self {
+        match (&mut self, other) {
+            (Self::Dense { rows, .. }, Self::Dense { rows: other, .. }) => {
+                for (row, other) in rows.iter_mut().zip(&other) {
+                    row.merge(other);
+                }
+            }
+            (Self::Sparse(rows), Self::Sparse(other)) => {
+                for (key, row) in other {
+                    rows.entry(key).or_default().merge(&row);
+                }
+            }
+            _ => unreachable!("all partitions use the same catalog"),
+        }
+        self
+    }
+
+    pub fn into_rows(self) -> Vec<((u32, i32), CampaignDay)> {
+        match self {
+            Self::Dense {
+                first_day,
+                width,
+                rows,
+            } => rows
+                .into_iter()
+                .enumerate()
+                .filter(|(_, row)| row.sessions != 0 || row.assists != 0)
+                .map(|(i, row)| (((i % width) as u32, first_day + (i / width) as i32), row))
+                .collect(),
+            Self::Sparse(rows) => rows.into_iter().collect(),
+        }
+    }
+}
+
 pub struct Summary {
     pub users: Vec<UserDay>,
     pub campaigns: Campaigns,
@@ -160,18 +247,13 @@ fn person(
             active.remove(clicks[left].campaign);
             left += 1;
         }
-        for &campaign in &active.campaigns {
-            out.campaigns.entry((campaign, day)).or_default().assists += 1;
-        }
         let winner = if left < right {
             clicks[right - 1].campaign
         } else {
             0
         };
-        let credited = out.campaigns.entry((winner, day)).or_default();
-        credited.sessions += 1;
-        credited.revenue += revenue;
-        credited.purchasing += i64::from(revenue > 0);
+        out.campaigns
+            .record(day, winner, revenue, &active.campaigns);
     }
     daily.top = spend.finish_day();
     out.users.push(daily);
@@ -206,7 +288,10 @@ pub fn summarize(
     });
     clicks.dedup_by(|a, b| a.id == b.id && a.person == b.person && a.time == b.time);
 
-    let mut out = Summary::default();
+    let mut out = Summary {
+        users: Vec::new(),
+        campaigns: Campaigns::new(catalog),
+    };
     let mut spend = Spend {
         cents: vec![0; catalog.categories.len()],
         used: Vec::new(),

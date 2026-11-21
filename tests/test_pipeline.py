@@ -169,6 +169,25 @@ class PipelineTests(unittest.TestCase):
             write_part(data, "events", 0, [prefix + b"0" * 2_100_000 + b"7", prefix.replace(b"e1", b"e2") + b"3"])
             self.assertEqual(production(data, out), solve(data))
 
+    def test_wide_manifest_uses_sparse_campaign_totals(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            data, out = root / "data", root / "out"
+            setup_data(data)
+            (data / "manifest.json").write_text(json.dumps({
+                "window_start": "1969-12-31T00:00:00Z", "window_end": "2028-03-12T00:00:00Z",
+            }))
+            write_part(data, "events", 1, [
+                b"early,u,1969-12-31T00:00:00Z,1969-12-31T00:00:00Z,purchase,p1,10",
+                b"late,u,2028-02-29T01:00:00Z,2028-02-29T01:00:00Z,cart,p1,",
+            ])
+            write_part(data, "clicks", 1, [
+                b"before,u,c1,1969-12-24T00:00:00Z",
+                b"at,u,c2,1969-12-31T00:00:00Z",
+                b"other,u,c1,2028-02-29T00:00:00Z",
+            ])
+            self.assertEqual(production(data, out), solve(data))
+
     def test_large_component_whale_and_64bit_revenue(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

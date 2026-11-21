@@ -68,7 +68,6 @@ impl Catalog {
     }
 }
 
-#[derive(Default)]
 struct Components {
     indices: FxHashMap<Key, usize>,
     parent: Vec<usize>,
@@ -121,7 +120,15 @@ pub type People = FxHashMap<Key, Key>;
 
 pub fn people(data: &Path, keys: &Keys) -> Result<People> {
     let input = Input::open(&data.join("links"))?;
-    let mut sets = Components::default();
+    // Typical links have two short IDs. Reserving up front avoids repeatedly
+    // moving the alias map as the connected components are built.
+    let estimated_aliases = (input.bytes() / 16).min(1 << 22);
+    let mut sets = Components {
+        indices: FxHashMap::with_capacity_and_hasher(estimated_aliases, Default::default()),
+        parent: Vec::with_capacity(estimated_aliases),
+        size: Vec::with_capacity(estimated_aliases),
+        smallest: Vec::with_capacity(estimated_aliases),
+    };
     for chunk in input.chunks() {
         for row in lines(chunk.body()) {
             if let Some([a, b]) = fields(row)
@@ -132,7 +139,14 @@ pub fn people(data: &Path, keys: &Keys) -> Result<People> {
             }
         }
     }
-    let mut people = People::default();
+    let mut people = People::with_capacity_and_hasher(
+        sets.parent
+            .iter()
+            .enumerate()
+            .filter(|&(i, &p)| i != p)
+            .count(),
+        Default::default(),
+    );
     for (name, index) in std::mem::take(&mut sets.indices) {
         let root = sets.root(index);
         let canonical = sets.smallest[root];
