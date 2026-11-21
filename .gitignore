@@ -1,0 +1,10 @@
+/.work/
+/target/
+/.venv/
+/dev/
+/dev-answer/
+/out/
+/scratch/
+/*.zip
+__pycache__/
+.DS_Store

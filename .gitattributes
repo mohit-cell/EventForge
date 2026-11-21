@@ -1,0 +1,2 @@
+# Several fixture values deliberately contain carriage returns.
+fixtures/** -text

@@ -1,0 +1,227 @@
+use crate::catalog::Catalog;
+use crate::keys::{Key, Keys};
+use crate::parse::{DAY, GAP, WEEK};
+use crate::pipeline::{Click, Event};
+use rustc_hash::FxHashMap;
+
+#[derive(Default)]
+pub struct UserDay {
+    pub person: Key,
+    pub day: i32,
+    pub sessions: i64,
+    pub events: i64,
+    pub revenue: i64,
+    pub top: Option<u32>,
+}
+
+#[derive(Clone, Default)]
+pub struct CampaignDay {
+    pub sessions: i64,
+    pub purchasing: i64,
+    pub revenue: i64,
+    pub assists: i64,
+}
+
+impl CampaignDay {
+    pub fn merge(&mut self, other: &Self) {
+        self.sessions += other.sessions;
+        self.purchasing += other.purchasing;
+        self.revenue += other.revenue;
+        self.assists += other.assists;
+    }
+}
+
+pub type Campaigns = FxHashMap<(u32, i32), CampaignDay>;
+
+#[derive(Default)]
+pub struct Summary {
+    pub users: Vec<UserDay>,
+    pub campaigns: Campaigns,
+}
+
+struct Spend {
+    cents: Vec<i64>,
+    used: Vec<u32>,
+}
+
+impl Spend {
+    fn add(&mut self, category: u32, amount: u32) {
+        let value = &mut self.cents[category as usize];
+        if *value == 0 {
+            self.used.push(category);
+        }
+        *value += i64::from(amount);
+    }
+
+    fn finish_day(&mut self) -> Option<u32> {
+        // Category numbers are assigned in byte order, so the smaller number wins a tie.
+        let top = self
+            .used
+            .iter()
+            .copied()
+            .min_by_key(|&c| (-self.cents[c as usize], c));
+        for c in self.used.drain(..) {
+            self.cents[c as usize] = 0;
+        }
+        top
+    }
+}
+
+/// Counts support constant-time expiry. The dense active list enumerates each
+/// distinct assisting campaign once, including campaigns with no credited session.
+struct Active {
+    counts: Vec<usize>,
+    positions: Vec<usize>,
+    campaigns: Vec<u32>,
+}
+
+impl Active {
+    fn new(size: usize) -> Self {
+        Self {
+            counts: vec![0; size],
+            positions: vec![0; size],
+            campaigns: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, id: u32) {
+        let i = id as usize;
+        if self.counts[i] == 0 {
+            self.positions[i] = self.campaigns.len();
+            self.campaigns.push(id);
+        }
+        self.counts[i] += 1;
+    }
+
+    fn remove(&mut self, id: u32) {
+        let i = id as usize;
+        self.counts[i] -= 1;
+        if self.counts[i] == 0 {
+            let at = self.positions[i];
+            self.campaigns.swap_remove(at);
+            if let Some(&moved) = self.campaigns.get(at) {
+                self.positions[moved as usize] = at;
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        for id in self.campaigns.drain(..) {
+            self.counts[id as usize] = 0;
+        }
+    }
+}
+
+fn person(
+    events: &[Event],
+    clicks: &[Click],
+    spend: &mut Spend,
+    active: &mut Active,
+    out: &mut Summary,
+) {
+    let new_day = |day| UserDay {
+        person: events[0].person,
+        day,
+        ..Default::default()
+    };
+    let mut daily = new_day(events[0].time.div_euclid(DAY) as i32);
+    let (mut left, mut right, mut i) = (0, 0, 0);
+    while i < events.len() {
+        let start = events[i].time;
+        let day = start.div_euclid(DAY) as i32;
+        if daily.day != day {
+            daily.top = spend.finish_day();
+            out.users.push(daily);
+            daily = new_day(day);
+        }
+
+        let first = i;
+        let mut revenue = 0;
+        loop {
+            let event = &events[i];
+            if event.amount > 0 {
+                spend.add(event.category, event.amount);
+                revenue += i64::from(event.amount);
+            }
+            i += 1;
+            if i == events.len() || events[i].time - event.time > GAP {
+                break;
+            }
+        }
+        daily.sessions += 1;
+        daily.events += (i - first) as i64;
+        daily.revenue += revenue;
+
+        while right < clicks.len() && clicks[right].time <= start {
+            active.add(clicks[right].campaign);
+            right += 1;
+        }
+        while left < right && clicks[left].time < start - WEEK {
+            active.remove(clicks[left].campaign);
+            left += 1;
+        }
+        for &campaign in &active.campaigns {
+            out.campaigns.entry((campaign, day)).or_default().assists += 1;
+        }
+        let winner = if left < right {
+            clicks[right - 1].campaign
+        } else {
+            0
+        };
+        let credited = out.campaigns.entry((winner, day)).or_default();
+        credited.sessions += 1;
+        credited.revenue += revenue;
+        credited.purchasing += i64::from(revenue > 0);
+    }
+    daily.top = spend.finish_day();
+    out.users.push(daily);
+    active.reset();
+}
+
+fn gather<T>(parts: Vec<Vec<T>>) -> Vec<T> {
+    let mut parts = parts.into_iter();
+    let mut rows = parts.next().unwrap_or_default();
+    rows.reserve_exact(parts.as_slice().iter().map(Vec::len).sum());
+    for mut part in parts {
+        rows.append(&mut part);
+    }
+    rows
+}
+
+pub fn summarize(
+    events: Vec<Vec<Event>>,
+    clicks: Vec<Vec<Click>>,
+    keys: &Keys,
+    catalog: &Catalog,
+) -> Summary {
+    let mut events = gather(events);
+    let mut clicks = gather(clicks);
+    events.sort_unstable_by_key(|e| (e.person, e.time));
+    // The last eligible click must have the smallest byte ID among ties.
+    clicks.sort_unstable_by(|a, b| {
+        a.person
+            .cmp(&b.person)
+            .then(a.time.cmp(&b.time))
+            .then_with(|| keys.compare(b.id, a.id))
+    });
+    clicks.dedup_by(|a, b| a.id == b.id && a.person == b.person && a.time == b.time);
+
+    let mut out = Summary::default();
+    let mut spend = Spend {
+        cents: vec![0; catalog.categories.len()],
+        used: Vec::new(),
+    };
+    let mut active = Active::new(catalog.campaigns.len());
+    let mut remaining = clicks.as_slice();
+    for rows in events.chunk_by(|a, b| a.person == b.person) {
+        let who = rows[0].person;
+        while remaining.first().is_some_and(|c| c.person < who) {
+            remaining = &remaining[1..];
+        }
+        let count = remaining.iter().take_while(|c| c.person == who).count();
+        let (eligible_person, rest) = remaining.split_at(count);
+        person(rows, eligible_person, &mut spend, &mut active, &mut out);
+        remaining = rest;
+    }
+    out
+}
