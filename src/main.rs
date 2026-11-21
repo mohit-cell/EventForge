@@ -7,8 +7,10 @@ mod parse;
 mod pipeline;
 
 use anyhow::{Context, Result, ensure};
+use catalog::Catalog;
 use input::Input;
 use keys::Keys;
+use pipeline::{CompactEvent, EventPayload, WideEvent};
 use rayon::prelude::*;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -23,20 +25,35 @@ impl Timer {
 }
 
 fn run(data: &Path, output: &Path) -> Result<()> {
-    let mut timer = Timer(Instant::now());
+    let timer = Timer(Instant::now());
     let keys = Keys::default();
-    let catalog = catalog::Catalog::load(data)?;
+    let catalog = Catalog::load(data)?;
     let input = Input::open(&data.join("events"))?;
+    if CompactEvent::supports(&catalog) {
+        process::<CompactEvent>(data, output, &keys, &catalog, input, timer)
+    } else {
+        process::<WideEvent>(data, output, &keys, &catalog, input, timer)
+    }
+}
+
+fn process<P: EventPayload>(
+    data: &Path,
+    output: &Path,
+    keys: &Keys,
+    catalog: &Catalog,
+    input: Input,
+    mut timer: Timer,
+) -> Result<()> {
     let bins = input
         .bytes()
         .div_ceil(4 << 20)
         .clamp(1, 256)
         .next_power_of_two();
     let (people, candidates) = rayon::join(
-        || catalog::people(data, &keys),
+        || catalog::people(data, keys),
         || {
             input::partition(&input, bins, |line| {
-                pipeline::candidate(line, &keys, &catalog, bins)
+                pipeline::candidate::<P>(line, keys, catalog, bins)
             })
         },
     );
@@ -48,7 +65,7 @@ fn run(data: &Path, output: &Path) -> Result<()> {
 
     let input = Input::open(&data.join("clicks"))?;
     let clicks = input::partition(&input, bins, |line| {
-        pipeline::click(line, &keys, &catalog, &people, bins)
+        pipeline::click(line, keys, catalog, &people, bins)
     });
     drop(input);
     drop(people);
@@ -56,10 +73,10 @@ fn run(data: &Path, output: &Path) -> Result<()> {
     let results: Vec<_> = events
         .into_par_iter()
         .zip(clicks)
-        .map(|(events, clicks)| aggregate::summarize(events, clicks, &keys, &catalog))
+        .map(|(events, clicks)| aggregate::summarize(events, clicks, keys, catalog))
         .collect();
     timer.report("sort, sessionize and attribute");
-    let counts = output::write(output, results, &keys, &catalog)?;
+    let counts = output::write(output, results, keys, catalog)?;
     timer.report("write parquet");
     eprintln!("{} person-days, {} campaign-days", counts.0, counts.1);
     Ok(())

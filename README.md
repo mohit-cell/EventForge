@@ -55,9 +55,9 @@ For example, fixture E3 has a view by `u1` at 23:50 UTC on October 3 and a 1,000
 
 1. **Resolve identities.** Union by size and path compression join every valid link while other workers parse events. Each component stores its byte-wise minimum ID independently of its tree root. This handles long chains, shared devices and names that appear only in links. Short nonzero ASCII IDs pack losslessly into 63 bits. Longer strings, Unicode and embedded zero bytes use a sharded dictionary with full byte equality.
 2. **Read and deduplicate events.** Workers claim 1 MiB ranges in read-only memory maps and align them to LF boundaries. The worker owning a line's first byte processes the entire line. SIMD locates separators and quotes in short event and click rows on x86-64 and arm64. Each structurally valid, nonempty event ID enters one hash partition. A bitmap identifies hash slots with a single row. Rows in slots hit more than once are compared by exact ID and minimum ingest time. An invalid payload still competes for the minimum, so a later valid copy cannot rescue it. Purchases require 1 through 10,000,000 cents. The 24-hour lateness cutoff is inclusive.
-3. **Form sessions.** Surviving events move into partitions by canonical person. Each partition sorts by person and millisecond time. Gaps over 1,800,000 ms start a new session. All events in a session use its UTC start day. Per-day category sums resolve revenue ties by byte order, including the fallback category `unknown`.
+3. **Form sessions.** Surviving events move into partitions by canonical person. Each partition groups by person, then sorts each person's events by millisecond time. When the manifest spans at most 2³¹ milliseconds and the catalog has at most 512 categories, each event takes 16 bytes in memory. A wider record supports larger windows and catalogs. Gaps over 1,800,000 ms start a new session. All events in a session use its UTC start day. Per-day category sums resolve revenue ties by byte order, including the fallback category `unknown`.
 4. **Attribute sessions.** Clean clicks sort by person and time, with descending byte-wise click ID within a time tie. Identical copies become adjacent and collapse. Two forward-only cursors maintain the inclusive seven-day click window for each session. The last eligible click wins. Counts and an indexed list of active campaigns give one assist per qualifying campaign per session. Without an eligible click, `organic` receives the credit.
-5. **Write the tables.** Workers aggregate person-days and campaign counters locally. Typical manifest windows use campaign counters indexed directly by day and campaign. Larger windows or catalogs use a sparse map. Eight user partitions encode Snappy Parquet in parallel, while campaign counters merge into one file. Every footer is finished before publication. A directory lock serializes publishers and temporary hard links support rollback on a rename error. Retries replace the same nine part names. Consumers should read after the process exits successfully.
+5. **Write the tables.** Workers aggregate person-days and campaign counters locally. Typical manifest windows use campaign counters indexed directly by day and campaign. Larger windows or catalogs use a sparse map. Eight user partitions encode Snappy Parquet in parallel, while campaign counters merge into one file. Each user row group stores IDs in one shared byte buffer during encoding. Every footer is finished before publication. A directory lock serializes publishers and temporary hard links support rollback on a rename error. Retries replace the same nine part names. Consumers should read after the process exits successfully.
 
 For `E` structurally valid event copies, `C` clicks and `L` links, cleaning and hash partitioning are linear on average. Link operations are amortized near-constant. Sorting costs at most `O(E log E + C log C)`. The subsequent scan is linear in rows plus the number of distinct campaign assists counted. The implementation holds partitioned rows in RAM. Peak memory depends on row count and ID length. It assumes the specified clean lookups, valid F1 ingest timestamps, and identical click duplicates. Invalid manifest or filesystem operations exit with an error.
 
@@ -92,6 +92,17 @@ python scripts/compare.py .work/oracle-dev .work/dev-answer
 ~~~
 
 ## Performance
+
+The current implementation was measured against `6a82323` on an Apple silicon Mac with 16 GiB of memory, Rust 1.90.0, and eight workers. The binaries alternated after a warm-up. Timings cover the full process, including Parquet output.
+
+| Generated events | Generated clicks | Seed | Before | After | Reduction |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 20,000,000 | 5,000,000 | 73 | 0.763 s | 0.619 s | 18.9% |
+| 60,000,000 | 15,000,000 | 97 | 6.079 s | 5.506 s | 9.4% |
+
+The 20M median uses five measured runs per binary, and the 60M median uses three. Both Parquet tables matched the baseline row for row on both datasets. The 1M dev seed matched the independent Python oracle. The buildathon's Linux amd64 container and hidden inputs require a separate timing.
+
+### Earlier optimization
 
 Compared with `081cac3`, the optimized build reduces end-to-end native runtime on both the practice-scale and final-scale generated datasets. These measurements used Rust 1.90.0 release builds, eight workers and an Apple silicon Mac with 16 GiB of memory. Each median covers three measured runs per binary after a warm-up, with the execution order alternating.
 

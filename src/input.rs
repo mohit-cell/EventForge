@@ -107,8 +107,11 @@ pub fn empty_buckets<T>(n: usize) -> Vec<Vec<T>> {
     (0..n).map(|_| Vec::new()).collect()
 }
 
+// Each shard contains one row buffer per contributing worker.
+pub type Shards<T> = Vec<Vec<Vec<T>>>;
+
 /// Move the worker-local buffers into shard order without copying their rows.
-pub fn transpose<T>(workers: Vec<Vec<Vec<T>>>, bins: usize) -> Vec<Vec<Vec<T>>> {
+pub fn transpose<T>(workers: Vec<Vec<Vec<T>>>, bins: usize) -> Shards<T> {
     let mut result = empty_buckets(bins);
     for worker in workers {
         for (part, rows) in result.iter_mut().zip(worker) {
@@ -124,7 +127,7 @@ pub fn partition<T: Send>(
     input: &Input,
     bins: usize,
     parse: impl Fn(&[u8]) -> Option<(usize, T)> + Sync,
-) -> Vec<Vec<Vec<T>>> {
+) -> Shards<T> {
     let chunks = input.chunks();
     let next = AtomicUsize::new(0);
     let workers = rayon::current_num_threads().min(chunks.len());

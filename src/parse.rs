@@ -3,6 +3,7 @@ use memchr::memchr2;
 pub const DAY: i64 = 86_400_000;
 pub const WEEK: i64 = 7 * DAY;
 pub const GAP: i64 = 1_800_000;
+const ASCII_ZEROES: u64 = u64::from_le_bytes([b'0'; 8]);
 
 /// The dialect has no embedded delimiters, escaped quotes, or multiline values.
 #[inline]
@@ -17,16 +18,41 @@ pub fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline]
 fn short_fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
-    let mut commas = 0u128;
-    let mut quotes = 0u128;
+    // Use fixed shifts for all complete blocks. Only the overlapping last
+    // block needs a variable shift, and every load stays inside the row.
     let last = line.len() - 16;
-    // Overlap the last block if necessary so every vector load stays in the line.
-    for offset in (0..last).step_by(16).chain(std::iter::once(last)) {
-        // SAFETY: offsets are at most line.len() - 16. SSE2 and NEON are
-        // baseline features of the respective 64-bit targets.
-        let (c, q) = unsafe { punctuation(line.as_ptr().add(offset)) };
-        commas |= u128::from(c) << offset;
-        quotes |= u128::from(q) << offset;
+    let load = |offset| {
+        // SAFETY: each caller supplies an offset at most line.len() - 16.
+        unsafe { punctuation(line.as_ptr().add(offset)) }
+    };
+    let (c, q) = load(last);
+    let mut commas = u128::from(c) << last;
+    let mut quotes = u128::from(q) << last;
+    macro_rules! block {
+        ($offset:expr) => {{
+            let (c, q) = load($offset);
+            commas |= u128::from(c) << $offset;
+            quotes |= u128::from(q) << $offset;
+        }};
+    }
+    block!(0);
+    if last > 16 {
+        block!(16);
+    }
+    if last > 32 {
+        block!(32);
+    }
+    if last > 48 {
+        block!(48);
+    }
+    if last > 64 {
+        block!(64);
+    }
+    if last > 80 {
+        block!(80);
+    }
+    if last > 96 {
+        block!(96);
     }
     if commas.count_ones() as usize != N - 1 {
         return None;
@@ -121,6 +147,27 @@ fn two(bytes: &[u8], at: usize) -> Option<i64> {
     (a < 10 && b < 10).then_some(i64::from(a) * 10 + i64::from(b))
 }
 
+#[inline]
+fn digits(word: u64) -> Option<u64> {
+    // An ASCII byte outside '0'..='9' either borrows on subtraction or sets
+    // its high bit on addition. The original high bits reject non-ASCII.
+    if (word | word.wrapping_sub(ASCII_ZEROES) | word.wrapping_add(0x4646_4646_4646_4646))
+        & 0x8080_8080_8080_8080
+        != 0
+    {
+        return None;
+    }
+    Some(word ^ ASCII_ZEROES)
+}
+
+#[inline]
+fn decimal_eight(ascii: u64) -> Option<i64> {
+    let bytes = digits(ascii)?;
+    let pairs = (bytes * 10 + (bytes >> 8)) & 0x00ff_00ff_00ff_00ff;
+    let groups = (pairs * 100 + (pairs >> 16)) & 0x0000_ffff_0000_ffff;
+    Some(((groups & 0xffff) * 10_000 + (groups >> 32)) as i64)
+}
+
 fn decimal(bytes: &[u8], max: i64) -> Option<i64> {
     if bytes.is_empty() {
         return None;
@@ -197,18 +244,33 @@ const MONTHS: [(i32, i64); 12] = [
     (334, 31),
 ];
 
+#[inline]
 fn civil_ms(s: &[u8]) -> Option<i64> {
-    if s[4] != b'-' || s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+    const DATE_SEPARATORS: u64 = u64::from_le_bytes([0, 0, 0, 0, 255, 0, 0, 255]);
+    const CLOCK_SEPARATORS: u64 = u64::from_le_bytes([0, 0, 255, 0, 0, 255, 0, 0]);
+    const DATE_MARKS: u64 = u64::from_le_bytes(*b"\0\0\0\0-\0\0-");
+    const CLOCK_MARKS: u64 = u64::from_le_bytes(*b"\0\0:\0\0:\0\0");
+    let date = u64::from_le_bytes(s[..8].try_into().unwrap());
+    let clock = u64::from_le_bytes(s[11..19].try_into().unwrap());
+    if s[10] != b'T'
+        || date & DATE_SEPARATORS != DATE_MARKS
+        || clock & CLOCK_SEPARATORS != CLOCK_MARKS
+    {
         return None;
     }
-    let year = two(s, 0)? * 100 + two(s, 2)?;
-    let month = two(s, 5)?;
+    // Replace the checked separators with ASCII zeroes before validating digits.
+    let date = digits(date ^ ((ASCII_ZEROES ^ DATE_MARKS) & DATE_SEPARATORS))?;
+    let clock = digits(clock ^ ((ASCII_ZEROES ^ CLOCK_MARKS) & CLOCK_SEPARATORS))?;
+    let date_pairs = date * 10 + (date >> 8);
+    let clock_pairs = clock * 10 + (clock >> 8);
+    let year = (date_pairs & 255) * 100 + ((date_pairs >> 16) & 255);
+    let month = ((date_pairs >> 40) & 255) as usize;
     let day = two(s, 8)?;
-    let hour = two(s, 11)?;
-    let minute = two(s, 14)?;
-    let second = two(s, 17)?;
+    let hour = (clock_pairs & 255) as i64;
+    let minute = ((clock_pairs >> 24) & 255) as i64;
+    let second = ((clock_pairs >> 48) & 255) as i64;
     let (year_start, leap) = YEARS[year as usize];
-    let &(month_start, length) = MONTHS.get((month - 1) as usize)?;
+    let &(month_start, length) = MONTHS.get(month.wrapping_sub(1))?;
     if day == 0
         || day > length + i64::from(leap && month == 2)
         || hour > 23
@@ -230,6 +292,13 @@ pub fn utc(s: &[u8]) -> Option<i64> {
 
 #[inline]
 pub fn timestamp(s: &[u8]) -> Option<i64> {
+    if let Ok(bytes) = <&[u8; 13]>::try_from(s) {
+        let prefix = decimal_eight(u64::from_le_bytes(bytes[..8].try_into().unwrap()))?;
+        let suffix = decimal_eight(u64::from_le_bytes([
+            b'0', b'0', b'0', bytes[8], bytes[9], bytes[10], bytes[11], bytes[12],
+        ]))?;
+        return Some(prefix * 100_000 + suffix);
+    }
     if s.get(4) == Some(&b'-') {
         if s.len() == 20 {
             return utc(s);

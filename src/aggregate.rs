@@ -1,7 +1,7 @@
 use crate::catalog::Catalog;
 use crate::keys::{Key, Keys};
 use crate::parse::{DAY, GAP, WEEK};
-use crate::pipeline::{Click, Event};
+use crate::pipeline::{Click, Event, EventPayload};
 use rustc_hash::FxHashMap;
 
 #[derive(Default)]
@@ -199,9 +199,10 @@ impl Active {
     }
 }
 
-fn person(
-    events: &[Event],
+fn person<P: EventPayload>(
+    events: &[Event<P>],
     clicks: &[Click],
+    origin: i64,
     spend: &mut Spend,
     active: &mut Active,
     out: &mut Summary,
@@ -211,10 +212,10 @@ fn person(
         day,
         ..Default::default()
     };
-    let mut daily = new_day(events[0].time.div_euclid(DAY) as i32);
+    let mut daily = new_day((events[0].time() + origin).div_euclid(DAY) as i32);
     let (mut left, mut right, mut i) = (0, 0, 0);
     while i < events.len() {
-        let start = events[i].time;
+        let start = events[i].time() + origin;
         let day = start.div_euclid(DAY) as i32;
         if daily.day != day {
             daily.top = spend.finish_day();
@@ -225,13 +226,14 @@ fn person(
         let first = i;
         let mut revenue = 0;
         loop {
-            let event = &events[i];
-            if event.amount > 0 {
-                spend.add(event.category, event.amount);
-                revenue += i64::from(event.amount);
+            let event = events[i];
+            let (amount, category) = event.purchase();
+            if amount > 0 {
+                spend.add(category, amount);
+                revenue += i64::from(amount);
             }
             i += 1;
-            if i == events.len() || events[i].time - event.time > GAP {
+            if i == events.len() || events[i].time() - event.time() > GAP {
                 break;
             }
         }
@@ -270,22 +272,20 @@ fn gather<T>(parts: Vec<Vec<T>>) -> Vec<T> {
     rows
 }
 
-pub fn summarize(
-    events: Vec<Vec<Event>>,
+pub fn summarize<P: EventPayload>(
+    events: Vec<Vec<Event<P>>>,
     clicks: Vec<Vec<Click>>,
     keys: &Keys,
     catalog: &Catalog,
 ) -> Summary {
     let mut events = gather(events);
     let mut clicks = gather(clicks);
-    events.sort_unstable_by_key(|e| (e.person, e.time));
+    events.sort_unstable_by_key(|e| e.person);
     // The last eligible click must have the smallest byte ID among ties.
-    clicks.sort_unstable_by(|a, b| {
-        a.person
-            .cmp(&b.person)
-            .then(a.time.cmp(&b.time))
-            .then_with(|| keys.compare(b.id, a.id))
-    });
+    clicks.sort_unstable_by_key(|c| c.person);
+    for group in clicks.chunk_by_mut(|a, b| a.person == b.person) {
+        group.sort_unstable_by(|a, b| a.time.cmp(&b.time).then_with(|| keys.compare(b.id, a.id)));
+    }
     clicks.dedup_by(|a, b| a.id == b.id && a.person == b.person && a.time == b.time);
 
     let mut out = Summary {
@@ -298,14 +298,22 @@ pub fn summarize(
     };
     let mut active = Active::new(catalog.campaigns.len());
     let mut remaining = clicks.as_slice();
-    for rows in events.chunk_by(|a, b| a.person == b.person) {
+    for rows in events.chunk_by_mut(|a, b| a.person == b.person) {
+        rows.sort_unstable_by_key(|e| e.time());
         let who = rows[0].person;
         while remaining.first().is_some_and(|c| c.person < who) {
             remaining = &remaining[1..];
         }
         let count = remaining.iter().take_while(|c| c.person == who).count();
         let (eligible_person, rest) = remaining.split_at(count);
-        person(rows, eligible_person, &mut spend, &mut active, &mut out);
+        person(
+            rows,
+            eligible_person,
+            catalog.start,
+            &mut spend,
+            &mut active,
+            &mut out,
+        );
         remaining = rest;
     }
     out

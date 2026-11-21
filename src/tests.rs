@@ -1,6 +1,7 @@
 use crate::input::{after_header, lines};
 use crate::keys::{Key, Keys};
 use crate::parse::{DAY, fields, price, timestamp};
+use crate::pipeline::{CompactEvent, EventPayload};
 
 #[test]
 fn csv_preserves_bytes_and_removes_only_outer_quotes() {
@@ -108,6 +109,35 @@ fn decimal_overflow_and_zero_padding() {
     for bad in [b"".as_slice(), b"0", b"10000001", b"1.0", b"-1", b"42\r"] {
         assert_eq!(price(bad), None);
     }
+}
+
+#[test]
+fn word_at_a_time_timestamp_checks_each_byte() {
+    for valid in [
+        b"2028-02-29T23:59:00Z".as_slice(),
+        b"2028-03-01T00:59:00+01:00",
+        b"1835481540000",
+    ] {
+        assert!(timestamp(valid).is_some());
+        let mut changed = valid.to_vec();
+        for (index, &original) in valid.iter().enumerate() {
+            if original.is_ascii_digit() {
+                for byte in (0..=u8::MAX).filter(|b| !b.is_ascii_digit()) {
+                    changed[index] = byte;
+                    assert_eq!(timestamp(&changed), None, "{changed:?}");
+                }
+                changed[index] = original;
+            }
+        }
+    }
+}
+
+#[test]
+fn compact_event_keeps_high_bits_and_maximum_price() {
+    let time = (1_i64 << 31) - 1;
+    let event = CompactEvent::new(time, 10_000_000, 511);
+    assert_eq!(event.time(), time);
+    assert_eq!(event.purchase(), (10_000_000, 511));
 }
 
 #[test]
