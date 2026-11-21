@@ -282,12 +282,10 @@ pub fn summarize<P: EventPayload>(
     let mut clicks = gather(clicks);
     events.sort_unstable_by_key(|e| e.person);
     // The last eligible click must have the smallest byte ID among ties.
-    clicks.sort_unstable_by(|a, b| {
-        a.person
-            .cmp(&b.person)
-            .then(a.time.cmp(&b.time))
-            .then_with(|| keys.compare(b.id, a.id))
-    });
+    clicks.sort_unstable_by_key(|c| c.person);
+    for group in clicks.chunk_by_mut(|a, b| a.person == b.person) {
+        group.sort_unstable_by(|a, b| a.time.cmp(&b.time).then_with(|| keys.compare(b.id, a.id)));
+    }
     clicks.dedup_by(|a, b| a.id == b.id && a.person == b.person && a.time == b.time);
 
     let mut out = Summary {
