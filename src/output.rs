@@ -4,7 +4,7 @@ use crate::keys::{Key, Keys};
 use anyhow::{Context, Result, bail};
 use parquet::basic::Compression;
 use parquet::data_type::{ByteArray, ByteArrayType, DataType, Int32Type, Int64Type};
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
 use parquet::schema::parser::parse_message_type;
 use parquet::schema::types::ColumnPath;
@@ -34,6 +34,7 @@ fn file(dir: &Path, schema: &str) -> Result<(NamedTempFile, SerializedFileWriter
         .set_permissions(fs::Permissions::from_mode(0o644))?;
     let props = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
+        .set_statistics_enabled(EnabledStatistics::None)
         .set_column_dictionary_enabled(ColumnPath::from("user_id"), false)
         .build();
     let writer = SerializedFileWriter::new(
@@ -65,16 +66,25 @@ fn user_batch(
 ) -> Result<()> {
     let mut group = writer.next_row_group()?;
     let mut last = Key::EMPTY;
-    let mut bytes = ByteArray::default();
-    let names = rows
+    let mut names = Vec::with_capacity(rows.len() * 3);
+    let mut span = (0, 0);
+    let spans: Vec<_> = rows
         .iter()
         .map(|r| {
             if r.person != last {
                 last = r.person;
-                bytes = ByteArray::from(keys.bytes(last));
+                let start = names.len();
+                keys.append_bytes(last, &mut names);
+                span = (start, names.len() - start);
             }
-            bytes.clone()
+            span
         })
+        .collect();
+    // A single byte buffer backs all IDs in the row group.
+    let names = ByteArray::from(names);
+    let names = spans
+        .into_iter()
+        .map(|(start, len)| names.slice(start, len))
         .collect();
     column::<ByteArrayType>(&mut group, names, None)?;
     column::<Int32Type>(&mut group, rows.iter().map(|r| r.day).collect(), None)?;

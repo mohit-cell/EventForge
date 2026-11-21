@@ -21,12 +21,11 @@ impl Key {
         self.mixed() as usize & (count - 1)
     }
 
-    fn inline_bytes(self) -> Vec<u8> {
+    fn inline_bytes(self) -> impl Iterator<Item = u8> {
         (0..9)
             .rev()
-            .map(|i| ((self.0 >> (i * 7)) & 127) as u8)
+            .map(move |i| ((self.0 >> (i * 7)) & 127) as u8)
             .take_while(|&c| c != 0)
-            .collect()
     }
 }
 
@@ -101,12 +100,18 @@ impl Keys {
     }
 
     pub fn bytes(&self, key: Key) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        self.append_bytes(key, &mut bytes);
+        bytes
+    }
+
+    pub fn append_bytes(&self, key: Key, out: &mut Vec<u8>) {
         if key.0 & INDIRECT == 0 {
-            key.inline_bytes()
+            out.extend(key.inline_bytes());
         } else {
             let stripe = key.0 as usize % STRIPES;
             let index = (key.0 & !INDIRECT) as usize / STRIPES;
-            self.strings[stripe].lock().unwrap().values[index].to_vec()
+            out.extend_from_slice(&self.strings[stripe].lock().unwrap().values[index]);
         }
     }
 
