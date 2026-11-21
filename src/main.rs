@@ -26,20 +26,23 @@ fn run(data: &Path, output: &Path) -> Result<()> {
     let mut timer = Timer(Instant::now());
     let keys = Keys::default();
     let catalog = catalog::Catalog::load(data)?;
-    let people = catalog::people(data, &keys)?;
-    timer.report("dimensions and links");
-
     let input = Input::open(&data.join("events"))?;
     let bins = input
         .bytes()
         .div_ceil(4 << 20)
         .clamp(1, 256)
         .next_power_of_two();
-    let candidates = input::partition(&input, bins, |line| {
-        pipeline::candidate(line, &keys, &catalog, bins)
-    });
+    let (people, candidates) = rayon::join(
+        || catalog::people(data, &keys),
+        || {
+            input::partition(&input, bins, |line| {
+                pipeline::candidate(line, &keys, &catalog, bins)
+            })
+        },
+    );
+    let people = people?;
     drop(input);
-    timer.report("parse events");
+    timer.report("dimensions, links and event parsing");
     let events = pipeline::deduplicate(candidates, &people, bins);
     timer.report("deduplicate and partition people");
 

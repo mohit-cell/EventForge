@@ -7,6 +7,7 @@ use parquet::data_type::{ByteArray, ByteArrayType, DataType, Int32Type, Int64Typ
 use parquet::file::properties::WriterProperties;
 use parquet::file::writer::{SerializedFileWriter, SerializedRowGroupWriter};
 use parquet::schema::parser::parse_message_type;
+use parquet::schema::types::ColumnPath;
 use rayon::prelude::*;
 use std::fs::{self, File};
 use std::os::unix::fs::PermissionsExt;
@@ -33,6 +34,7 @@ fn file(dir: &Path, schema: &str) -> Result<(NamedTempFile, SerializedFileWriter
         .set_permissions(fs::Permissions::from_mode(0o644))?;
     let props = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
+        .set_column_dictionary_enabled(ColumnPath::from("user_id"), false)
         .build();
     let writer = SerializedFileWriter::new(
         temp.reopen()?,
@@ -89,7 +91,7 @@ fn user_batch(
     Ok(())
 }
 
-const USER_PARTS: usize = 4;
+const USER_PARTS: usize = 8;
 
 fn user_file(
     dir: &Path,
@@ -119,13 +121,10 @@ fn campaign_file(
     catalog: &Catalog,
 ) -> Result<(NamedTempFile, usize)> {
     let (temp, mut campaigns) = file(dir, CAMPAIGN)?;
-    let mut totals = Campaigns::default();
-    for partial in partials {
-        for (key, value) in partial {
-            totals.entry(key).or_default().merge(&value);
-        }
-    }
-    let mut rows: Vec<_> = totals.into_iter().collect();
+    let mut rows = partials
+        .into_par_iter()
+        .reduce_with(Campaigns::merge)
+        .map_or_else(Vec::new, Campaigns::into_rows);
     rows.sort_unstable_by_key(|r| r.0);
     for rows in rows.chunks(BATCH) {
         let mut group = campaigns.next_row_group()?;

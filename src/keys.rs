@@ -12,9 +12,13 @@ pub struct Key(u64);
 impl Key {
     pub const EMPTY: Self = Self(0);
 
-    pub fn bucket(self, count: usize) -> usize {
+    pub fn mixed(self) -> u64 {
         let mixed = self.0.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        (mixed ^ (mixed >> 32)) as usize & (count - 1)
+        mixed ^ (mixed >> 32)
+    }
+
+    pub fn bucket(self, count: usize) -> usize {
+        self.mixed() as usize & (count - 1)
     }
 
     fn inline_bytes(self) -> Vec<u8> {
@@ -49,7 +53,22 @@ impl Keys {
     /// by full byte equality. Hash collisions never identify distinct IDs.
     #[inline]
     pub fn get(&self, bytes: &[u8]) -> Key {
-        if bytes.len() <= 9 {
+        if matches!(bytes.len(), 8 | 9) {
+            let word = u64::from_be_bytes(bytes[..8].try_into().unwrap());
+            let last = if bytes.len() == 9 { bytes[8] } else { 0 };
+            // Check for a high bit or a zero byte before removing the eight padding bits.
+            if (word | word.wrapping_sub(0x0101_0101_0101_0101)) & 0x8080_8080_8080_8080 == 0
+                && (bytes.len() == 8 || last.wrapping_sub(1) < 127)
+            {
+                let pairs = (word & 0x007f_007f_007f_007f) | ((word >> 1) & 0x3f80_3f80_3f80_3f80);
+                let quads =
+                    (pairs & 0x0000_3fff_0000_3fff) | ((pairs >> 2) & 0x0fff_c000_0fff_c000);
+                let packed = (quads & 0x0fff_ffff) | ((quads >> 4) & 0x00ff_ffff_f000_0000);
+                return Key((packed << 7) | u64::from(last));
+            }
+            return self.intern(bytes);
+        }
+        if bytes.len() < 8 {
             let mut packed = 0u64;
             let mut valid = true;
             for &byte in bytes {
